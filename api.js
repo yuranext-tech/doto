@@ -546,9 +546,9 @@ bot.on('callback_query', async (q) => {
 
     if (data === 'onboard:state') {
         await bot.sendMessage(chatId, 'Как тебе сегодня?', { reply_markup: { inline_keyboard: [
-            [{ text: '🌿 спокойно, без разговоров', callback_data: 'state:calm' }],
-            [{ text: '🙂 по настроению', callback_data: 'state:neutral' }],
-            [{ text: '⚡ готов включаться', callback_data: 'state:active' }]
+            [{ text: '🤍 Можно почти не разговаривать', callback_data: 'state:calm' }],
+[{ text: '🙂 Немного общения', callback_data: 'state:neutral' }],
+[{ text: '⚡ Более живой формат', callback_data: 'state:active' }]
         ]}});
     }
     if (data.startsWith('state:')) {
