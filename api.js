@@ -435,6 +435,21 @@ app.post('/feedback', async (req, res) => {
 // ============================================================
 // POST /users — регистрация
 // ============================================================
+// GET /users?telegramId=xxx — найти пользователя по telegram_id
+app.get('/users', async (req, res) => {
+    try {
+        const { telegramId } = req.query;
+        const result = await query(
+            `SELECT * FROM users WHERE telegram_id = $1`,
+            [telegramId]
+        );
+        if (!result.rows.length) return res.status(404).json({ error: 'Not found' });
+        res.json(result.rows[0]);
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
 app.post('/users', async (req, res) => {
     const { telegramId, username, ageGroup, currentState } = req.body;
 
