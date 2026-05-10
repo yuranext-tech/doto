@@ -524,11 +524,10 @@ bot.onText(/\/tasks/, async (msg) => {
     if (!feed.rows.length) return bot.sendMessage(chatId, 'Сейчас встреч нет. Загляни через пару часов.');
     for (const m of feed.rows) {
         const date = new Date(m.scheduled_at).toLocaleString('ru-RU');
-        const slots = parseInt(m.participant_count) === 1 ? '👥 1 из 2 — уже ждут' : '👥 0 из 2';
         await bot.sendMessage(chatId,
-            `📍 ${m.location_name || 'Место встречи'}\n🎯 ${m.title}\n\n${date}\n${slots}`,
-            { reply_markup: { inline_keyboard: [[{ text: 'Иду', callback_data: `join:${m.id}` }, { text: 'Подробнее', callback_data: `detail:${m.id}` }]] }}
-        );
+    `📍 ${m.location_name || 'Место встречи'}\n\n${m.description || m.title}\n\n${date} · 👥 Небольшая встреча`,
+    { reply_markup: { inline_keyboard: [[{ text: 'Иду', callback_data: `join:${m.id}` }, { text: 'Другой вариант', callback_data: 'show_feed' }]] }}
+);
     }
 });
 
