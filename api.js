@@ -490,3 +490,156 @@ app.get('/users/:id/dp', async (req, res) => {
 // ============================================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Doto API running on port ${PORT}`));
+// ============================================================
+// BOT — встроен в API процесс
+// ============================================================
+const TelegramBot = require('node-telegram-bot-api');
+const TOKEN = process.env.TELEGRAM_TOKEN;
+const bot = new TelegramBot(TOKEN, { polling: true });
+const onboarding = {};
+
+bot.onText(/\/start/, async (msg) => {
+    const chatId = msg.chat.id;
+    const telegramId = msg.from.id;
+    const username = msg.from.username || msg.from.first_name;
+    onboarding[chatId] = { telegramId, username };
+    await bot.sendMessage(chatId,
+        'Doto — задания в парке или библиотеке.\nДля студентов и тех кому 18–25.\n\nНикакого знакомства если не хочешь — просто оказаться рядом пока делаешь что-то.',
+        { reply_markup: { inline_keyboard: [[{ text: 'Попробовать', callback_data: 'onboard:state' }]] }}
+    );
+});
+
+bot.onText(/\/tasks/, async (msg) => {
+    const chatId = msg.chat.id;
+    const result = await query(`SELECT id FROM users WHERE telegram_id = $1`, [msg.from.id]);
+    if (!result.rows.length) return bot.sendMessage(chatId, 'Сначала зарегистрируйся — нажми /start');
+    const userId = result.rows[0].id;
+    const feed = await query(
+        `SELECT m.*, t.title, t.description,
+         (SELECT COUNT(*) FROM meeting_participants mp WHERE mp.meeting_id = m.id) as participant_count
+         FROM meetings m JOIN tasks t ON t.id = m.task_id
+         WHERE m.status IN ('open','partial') AND m.scheduled_at > NOW()
+         LIMIT 3`
+    );
+    if (!feed.rows.length) return bot.sendMessage(chatId, 'Сейчас встреч нет. Загляни через пару часов.');
+    for (const m of feed.rows) {
+        const date = new Date(m.scheduled_at).toLocaleString('ru-RU');
+        const slots = parseInt(m.participant_count) === 1 ? '👥 1 из 2 — уже ждут' : '👥 0 из 2';
+        await bot.sendMessage(chatId,
+            `📍 ${m.location_name || 'Место встречи'}\n🎯 ${m.title}\n\n${date}\n${slots}`,
+            { reply_markup: { inline_keyboard: [[{ text: 'Иду', callback_data: `join:${m.id}` }, { text: 'Подробнее', callback_data: `detail:${m.id}` }]] }}
+        );
+    }
+});
+
+bot.onText(/\/dp/, async (msg) => {
+    const result = await query(`SELECT dp FROM users WHERE telegram_id = $1`, [msg.from.id]);
+    if (!result.rows.length) return;
+    bot.sendMessage(msg.chat.id, `Твой баланс: ${result.rows[0].dp} DP`);
+});
+
+bot.on('callback_query', async (q) => {
+    const chatId = q.message.chat.id;
+    const data = q.data;
+    const telegramId = q.from.id;
+    await bot.answerCallbackQuery(q.id);
+
+    if (data === 'onboard:state') {
+        await bot.sendMessage(chatId, 'Как тебе сегодня?', { reply_markup: { inline_keyboard: [
+            [{ text: '🌿 спокойно, без разговоров', callback_data: 'state:calm' }],
+            [{ text: '🙂 по настроению', callback_data: 'state:neutral' }],
+            [{ text: '⚡ готов включаться', callback_data: 'state:active' }]
+        ]}});
+    }
+    if (data.startsWith('state:')) {
+        const state = data.split(':')[1];
+        onboarding[chatId] = { ...onboarding[chatId], state };
+        await bot.sendMessage(chatId, 'Тебе ближе:', { reply_markup: { inline_keyboard: [
+            [{ text: '🎓 студент (18–21)', callback_data: 'age:student' }],
+            [{ text: '🧑 уже работаю (22–25)', callback_data: 'age:early_work' }]
+        ]}});
+    }
+    if (data.startsWith('age:')) {
+        const ageGroup = data.split(':')[1];
+        const ob = onboarding[chatId] || {};
+        const result = await query(
+            `INSERT INTO users (id, telegram_id, username, age_group, current_state)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (telegram_id) DO UPDATE SET username = EXCLUDED.username
+             RETURNING *`,
+            [require('uuid').v4(), telegramId, ob.username, ageGroup, ob.state]
+        );
+        onboarding[chatId] = { ...ob, userId: result.rows[0].id };
+        await bot.sendMessage(chatId, 'Готово. Покажу ближайшие встречи.',
+            { reply_markup: { inline_keyboard: [[{ text: 'Смотреть встречи', callback_data: 'show_feed' }]] }}
+        );
+    }
+    if (data === 'show_feed') {
+        bot.emit('message', { ...q.message, text: '/tasks', from: q.from });
+    }
+    if (data.startsWith('join:')) {
+        const meetingId = data.split(':')[1];
+        const userRes = await query(`SELECT id FROM users WHERE telegram_id = $1`, [telegramId]);
+        if (!userRes.rows.length) return;
+        const userId = userRes.rows[0].id;
+        const client = await pool.connect();
+        try {
+            await client.query('BEGIN');
+            const m = await client.query(`SELECT * FROM meetings WHERE id = $1 FOR UPDATE`, [meetingId]);
+            if (!m.rows.length || !['open','partial'].includes(m.rows[0].status)) {
+                await client.query('ROLLBACK');
+                return bot.sendMessage(chatId, 'Место уже занято.');
+            }
+            const cnt = await client.query(`SELECT COUNT(*) FROM meeting_participants WHERE meeting_id = $1`, [meetingId]);
+            if (parseInt(cnt.rows[0].count) >= 2) {
+                await client.query('ROLLBACK');
+                return bot.sendMessage(chatId, 'Место уже занято.');
+            }
+            await client.query(`INSERT INTO meeting_participants (id, meeting_id, user_id) VALUES ($1,$2,$3)`, [require('uuid').v4(), meetingId, userId]);
+            const newStatus = parseInt(cnt.rows[0].count) === 0 ? 'partial' : 'matched';
+            await client.query(`UPDATE meetings SET status=$1 WHERE id=$2`, [newStatus, meetingId]);
+            await client.query('COMMIT');
+            await bot.sendMessage(chatId, 'Ты записан.\n\nНичего готовить не нужно. Просто приди.');
+        } catch(e) {
+            await client.query('ROLLBACK');
+        } finally {
+            client.release();
+        }
+    }
+    if (data.startsWith('detail:')) {
+        await bot.sendMessage(chatId, '🕐 0–10 мин: найди место\n🕐 10–20 мин: сделайте вместе\n🕐 20–30 мин: зафиксируйте\n🕐 30–40 мин: свободно',
+            { reply_markup: { inline_keyboard: [[{ text: 'Иду', callback_data: `join:${data.split(':')[1]}` }]] }}
+        );
+    }
+    if (data.startsWith('feedback:')) {
+        const [, meetingId, experience] = data.split(':');
+        const userRes = await query(`SELECT id FROM users WHERE telegram_id = $1`, [telegramId]);
+        if (!userRes.rows.length) return;
+        await query(`UPDATE feedback SET experience=$1, answered_at=NOW() WHERE user_id=$2 AND meeting_id=$3`, [experience, userRes.rows[0].id, meetingId]);
+        await bot.sendMessage(chatId, 'Спасибо.');
+    }
+    if (data.startsWith('comfort:')) {
+        const [, meetingId, comfort] = data.split(':');
+        const userRes = await query(`SELECT id FROM users WHERE telegram_id = $1`, [telegramId]);
+        if (!userRes.rows.length) return;
+        if (comfort === 'no') {
+            await bot.sendMessage(chatId, 'Что было не так?', { reply_markup: { inline_keyboard: [
+                [{ text: 'Не мой возраст', callback_data: `reason:${meetingId}:age` }],
+                [{ text: 'Некомфортное поведение', callback_data: `reason:${meetingId}:behavior` }],
+                [{ text: 'Другое', callback_data: `reason:${meetingId}:other` }]
+            ]}});
+        } else {
+            await query(`UPDATE feedback SET comfort=$1 WHERE user_id=$2 AND meeting_id=$3`, [comfort, userRes.rows[0].id, meetingId]);
+            await bot.sendMessage(chatId, 'Хорошо.');
+        }
+    }
+    if (data.startsWith('reason:')) {
+        const [, meetingId, reason] = data.split(':');
+        const userRes = await query(`SELECT id FROM users WHERE telegram_id = $1`, [telegramId]);
+        if (!userRes.rows.length) return;
+        await query(`UPDATE feedback SET comfort='no', reason=$1 WHERE user_id=$2 AND meeting_id=$3`, [reason, userRes.rows[0].id, meetingId]);
+        await bot.sendMessage(chatId, 'Понял. Учтём.');
+    }
+});
+
+console.log('Doto Bot attached to API process');
