@@ -10,7 +10,8 @@ const app = express();
 app.use(express.json());
 
 const pool = new Pool({
-   connectionString: process.env.DATABASE_URL || 'postgresql://postgres.kcdedrgylmxczjijoncx:DotoData2069@aws-1-eu-central-2.pooler.supabase.com:5432/postgres',
+    connectionString: process.env.DATABASE_URL || 'postgresql://postgres.kcdedrgylmxczjijoncx:DotoData2069@aws-1-eu-central-2.pooler.supabase.com:5432/postgres',
+    ssl: { rejectUnauthorized: false }
 });
 
 // ============================================================
