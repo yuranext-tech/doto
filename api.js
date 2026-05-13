@@ -1,5 +1,6 @@
 // ============================================================
 // DOTO — API + BOT (Express.js, webhook mode)
+// v1.4 — флоу без анкет. Архів разом / сам. Solo-режим.
 // ============================================================
 
 const express = require('express');
@@ -17,6 +18,9 @@ const pool = new Pool({
 
 const TOKEN = process.env.TELEGRAM_TOKEN;
 const APP_URL = process.env.APP_URL || 'https://doto-6zi6.onrender.com';
+const LOCATION = process.env.LOCATION || 'парк Шевченка, фонтан';
+const SLOT_HOUR = parseInt(process.env.SLOT_HOUR || '18');
+const SLOT_MIN = parseInt(process.env.SLOT_MIN || '30');
 
 const bot = new TelegramBot(TOKEN, { webHook: false });
 
@@ -47,6 +51,18 @@ async function query(sql, params) {
     }
 }
 
+function slotTimeStr() {
+    return `${String(SLOT_HOUR).padStart(2,'0')}:${String(SLOT_MIN).padStart(2,'0')}`;
+}
+
+function send(chatId, text, opts = {}) {
+    return bot.sendMessage(chatId, text, { parse_mode: 'Markdown', ...opts });
+}
+
+function kbd(rows) {
+    return { reply_markup: { inline_keyboard: rows } };
+}
+
 async function logEvent(client, { userId, meetingId, eventType, metadata = {} }) {
     await client.query(
         `INSERT INTO events (id, user_id, meeting_id, event_type, metadata) VALUES ($1, $2, $3, $4, $5)`,
@@ -59,8 +75,383 @@ async function changeDp(client, userId, amount, reason) {
     await client.query(`INSERT INTO dp_log (id, user_id, change, reason) VALUES ($1, $2, $3, $4)`, [uuidv4(), userId, amount, reason]);
 }
 
+async function getUser(telegramId) {
+    const r = await query(`SELECT * FROM users WHERE telegram_id = $1`, [String(telegramId)]);
+    return r.rows[0] || null;
+}
+
+async function getTodaySession(userId) {
+    const today = new Date().toISOString().split('T')[0];
+    const r = await query(
+        `SELECT * FROM meeting_participants mp
+         JOIN meetings m ON m.id = mp.meeting_id
+         WHERE mp.user_id = $1 AND DATE(m.scheduled_at) = $2
+         LIMIT 1`,
+        [userId, today]
+    );
+    return r.rows[0] || null;
+}
+
 // ============================================================
-// API ENDPOINTS
+// TASKS POOL
+// ============================================================
+
+const TASKS = {
+    A: [
+        'Знайди жабку, яка дивиться як твій колишній о 3 ночі.\nСфоткай крупним планом. Надішли сюди. Без слів.',
+        'Знайди дерево, яке ходить до психолога вже третій рік.\nСфоткай так, щоб було видно його проблему.',
+        'Знайди лавку, яка явно переживає розставання.\nСфоткай. Без підпису.',
+    ],
+    B: [
+        'Знайди місце, де хочеться говорити шепотом.\nПостій там 30 секунд.\nНадішли один емодзі, який описує повітря.',
+        'Знайди щось, що виглядає так, ніби воно чекає вже дуже давно.\nСфоткай. Надішли. Без слів.',
+        'Знайди місце в парку, де тихіше ніж скрізь.\nПостій хвилину. Надішли фото того, що побачив.',
+    ],
+    C: [
+        'Знайди тінь, яка схожа на тварину. Не кажи вголос, яку.\nСфоткай.\nЯкщо ви обидва вгадали одне й те саме — отримуєте несправжнє очко.',
+        'Знайдіть разом щось, що явно не на своєму місці.\nОбидва фоткаєте. Надсилаєте сюди.',
+    ],
+    SOLO: [
+        'Сьогодні точка тиха.\n\nЗнайди жабку, яка не хоче, щоб її знайшли.\nСфоткай так, ніби ти її спалив.\nНадішли. Вона йде в архів.',
+        'Сьогодні точка тиха.\n\nЗнайди місце, де місто звучить так, ніби про тебе забуло.\nПостій там 20 секунд.\nСфоткай щось, повз що всі проходять.',
+    ],
+};
+
+function pickTask(visitCount, hasParter) {
+    if (!hasParter) return { type: 'SOLO', text: TASKS.SOLO[Math.floor(Math.random() * TASKS.SOLO.length)] };
+    if (visitCount <= 1) return { type: 'A', text: TASKS.A[Math.floor(Math.random() * TASKS.A.length)] };
+    if (visitCount <= 4) return { type: 'B', text: TASKS.B[Math.floor(Math.random() * TASKS.B.length)] };
+    const pool = Math.random() < 0.5 ? TASKS.C : TASKS.B;
+    return { type: visitCount >= 5 ? 'C' : 'B', text: pool[Math.floor(Math.random() * pool.length)] };
+}
+
+// ============================================================
+// ARCHIVE HELPERS
+// ============================================================
+
+async function getArchiveSummary() {
+    const together = await query(
+        `SELECT caption FROM archive WHERE mode = 'together' ORDER BY created_at DESC LIMIT 4`
+    );
+    const solo = await query(
+        `SELECT caption FROM archive WHERE mode = 'solo' ORDER BY created_at DESC LIMIT 3`
+    );
+    const counts = await query(
+        `SELECT mode, COUNT(*) as c FROM archive GROUP BY mode`
+    );
+    const countMap = {};
+    counts.rows.forEach(r => { countMap[r.mode] = parseInt(r.c); });
+
+    return { together: together.rows, solo: solo.rows, counts: countMap };
+}
+
+async function addToArchive(mode, caption, fileId) {
+    await query(
+        `INSERT INTO archive (id, slot_date, mode, caption, file_id) VALUES ($1, $2, $3, $4, $5)`,
+        [uuidv4(), new Date().toISOString().split('T')[0], mode, caption, fileId || null]
+    );
+}
+
+// ============================================================
+// BOT — /start
+// ============================================================
+
+bot.onText(/\/start/, async (msg) => {
+    const chatId = msg.chat.id;
+    const telegramId = String(msg.from.id);
+    const username = msg.from.username || msg.from.first_name || '';
+
+    // Upsert user без анкет
+    await query(
+        `INSERT INTO users (id, telegram_id, username)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (telegram_id) DO UPDATE SET username = EXCLUDED.username`,
+        [uuidv4(), telegramId, username]
+    );
+
+    await send(chatId,
+        `Doto — привід ненадовго вийти в місто.\n\n` +
+        `15–20 хвилин. Можна мовчати.\n\n` +
+        `Ось як це виглядає:\n` +
+        `🐸 «Знайди жабку, яка дивиться як твій колишній о 3 ночі»\n` +
+        `🌳 «Знайди дерево, яке ходить до психолога»\n\n` +
+        `Приходиш — отримуєш завдання — робиш.\n` +
+        `Поруч може бути хтось. А може — ні.\n\n` +
+        `Найближча точка: сьогодні ${slotTimeStr()}, ${LOCATION}.`,
+        kbd([[
+            { text: '🌿 Хочу зайти', callback_data: 'join' },
+            { text: '📷 Архів точки', callback_data: 'archive' },
+        ]])
+    );
+});
+
+// ============================================================
+// BOT — callback_query
+// ============================================================
+
+bot.on('callback_query', async (q) => {
+    const chatId = q.message.chat.id;
+    const telegramId = String(q.from.id);
+    const data = q.data;
+    await bot.answerCallbackQuery(q.id);
+
+    // ── JOIN ──
+    if (data === 'join') {
+        await send(chatId,
+            `Готово.\n\n` +
+            `Нагадаємо за 15 хвилин до точки.\n\n` +
+            `Якщо передумаєш — просто не приходь. Без штрафів.\n\n` +
+            `Нічого не треба брати. Тільки телефон.\n` +
+            `І трохи настрою дивитися на світ дивно.`,
+            kbd([[{ text: 'Ок', callback_data: 'ok_joined' }]])
+        );
+
+        // Записуємо намір (meeting буде знайдено воркером при матчингу)
+        const user = await getUser(telegramId);
+        if (user) {
+            await query(
+                `INSERT INTO join_intents (id, user_id, slot_date, created_at)
+                 VALUES ($1, $2, $3, NOW())
+                 ON CONFLICT (user_id, slot_date) DO NOTHING`,
+                [uuidv4(), user.id, new Date().toISOString().split('T')[0]]
+            );
+        }
+        return;
+    }
+
+    if (data === 'ok_joined') {
+        await send(chatId, `До ${slotTimeStr()} ✦`);
+        return;
+    }
+
+    // ── ARCHIVE ──
+    if (data === 'archive') {
+        const { together, solo, counts } = await getArchiveSummary();
+
+        let text = `*Архів точки*\n\n`;
+
+        if ((counts.together || 0) > 0) {
+            text += `*Архів разом* — ${counts.together} фото:\n`;
+            together.forEach(a => { text += `📷 ${a.caption || '…'}\n`; });
+        } else {
+            text += `*Архів разом* — поки порожній\n`;
+        }
+
+        text += `\n`;
+
+        if ((counts.solo || 0) > 0) {
+            text += `*Архів сам* — ${counts.solo} фото:\n`;
+            solo.forEach(a => { text += `🌿 ${a.caption || '…'}\n`; });
+        } else {
+            text += `*Архів сам* — поки порожній\n`;
+        }
+
+        text += `\nНаступна точка: сьогодні ${slotTimeStr()}`;
+
+        await send(chatId, text, kbd([[
+            { text: '🔔 Нагадати мені', callback_data: 'notify_me' },
+            { text: '🌿 Хочу зайти', callback_data: 'join' },
+        ]]));
+        return;
+    }
+
+    // ── NOTIFY ME ──
+    if (data === 'notify_me') {
+        const user = await getUser(telegramId);
+        if (user) {
+            await query(`UPDATE users SET notify_next = TRUE WHERE id = $1`, [user.id]);
+        }
+        await send(chatId, `Нагадаємо коли точка відкриється. ✦`);
+        return;
+    }
+
+    // ── FEEDBACK: MOOD ──
+    if (data.startsWith('mood_')) {
+        const mood = parseInt(data.split('_')[1]);
+        const user = await getUser(telegramId);
+        const today = new Date().toISOString().split('T')[0];
+        if (user) {
+            await query(
+                `UPDATE meeting_participants SET feedback_mood = $1
+                 WHERE user_id = $2 AND meeting_id IN (
+                   SELECT id FROM meetings WHERE DATE(scheduled_at) = $3
+                 )`,
+                [mood, user.id, today]
+            );
+        }
+        await send(chatId,
+            `Хочеш ще раз?`,
+            kbd([[
+                { text: 'Так', callback_data: 'return_yes' },
+                { text: 'Ні', callback_data: 'return_no' },
+            ]])
+        );
+        return;
+    }
+
+    // ── FEEDBACK: RETURN ──
+    if (data === 'return_yes' || data === 'return_no') {
+        const wantsReturn = data === 'return_yes';
+        const user = await getUser(telegramId);
+        const today = new Date().toISOString().split('T')[0];
+        if (user) {
+            await query(
+                `UPDATE meeting_participants SET feedback_return = $1
+                 WHERE user_id = $2 AND meeting_id IN (
+                   SELECT id FROM meetings WHERE DATE(scheduled_at) = $3
+                 )`,
+                [wantsReturn, user.id, today]
+            );
+        }
+        await send(chatId,
+            `Розказав комусь про те, що було?`,
+            kbd([[
+                { text: 'Так', callback_data: 'shared_yes' },
+                { text: 'Ні', callback_data: 'shared_no' },
+            ]])
+        );
+        return;
+    }
+
+    // ── FEEDBACK: SHARED ──
+    if (data === 'shared_yes' || data === 'shared_no') {
+        const shared = data === 'shared_yes';
+        const user = await getUser(telegramId);
+        const today = new Date().toISOString().split('T')[0];
+
+        let wantsReturn = false;
+        let mode = 'solo';
+
+        if (user) {
+            await query(
+                `UPDATE meeting_participants SET feedback_shared = $1
+                 WHERE user_id = $2 AND meeting_id IN (
+                   SELECT id FROM meetings WHERE DATE(scheduled_at) = $3
+                 )`,
+                [shared, user.id, today]
+            );
+
+            const sess = await query(
+                `SELECT mp.feedback_return, mp.meeting_mode
+                 FROM meeting_participants mp
+                 JOIN meetings m ON m.id = mp.meeting_id
+                 WHERE mp.user_id = $1 AND DATE(m.scheduled_at) = $2
+                 LIMIT 1`,
+                [user.id, today]
+            );
+            if (sess.rows.length) {
+                wantsReturn = sess.rows[0].feedback_return;
+                mode = sess.rows[0].meeting_mode || 'solo';
+            }
+        }
+
+        // Архівна картка — тільки якщо хоче повернутись АБО розказав
+        if (wantsReturn || shared) {
+            if (mode === 'solo') {
+                await send(chatId,
+                    `Твоє фото в архіві сам точки.\n\n` +
+                    `Ти — частина дивної маленької історії.\n` +
+                    `Та, яку побачив ти.`
+                );
+            } else {
+                await send(chatId,
+                    `Твоє фото в архіві точки.\n\n` +
+                    `Ти — частина дивної маленької історії.`
+                );
+            }
+        }
+
+        if (wantsReturn) {
+            await send(chatId,
+                `Наступна точка: завтра ${slotTimeStr()}.`,
+                kbd([[{ text: '🔔 Нагадати', callback_data: 'notify_me' }]])
+            );
+        } else {
+            await send(chatId, `Добре. Підберемо нову точку, коли будеш готовий.`);
+        }
+        return;
+    }
+
+    // ── PARTNER CHOICE ──
+    if (data === 'partner_together') {
+        const user = await getUser(telegramId);
+        if (user) await query(`UPDATE users SET notify_next = TRUE WHERE id = $1`, [user.id]);
+        await send(chatId, `Добре. Наступна точка — разом. Нагадаємо.`);
+        return;
+    }
+
+    if (data === 'partner_new') {
+        const user = await getUser(telegramId);
+        if (user) await query(`UPDATE users SET notify_next = TRUE WHERE id = $1`, [user.id]);
+        await send(chatId, `Підберемо нового партнера. Нагадаємо.`);
+        return;
+    }
+});
+
+// ============================================================
+// BOT — фото від користувача → архів
+// ============================================================
+
+bot.on('photo', async (msg) => {
+    const chatId = msg.chat.id;
+    const telegramId = String(msg.from.id);
+    const today = new Date().toISOString().split('T')[0];
+
+    const user = await getUser(telegramId);
+    if (!user) return;
+
+    const sess = await query(
+        `SELECT mp.meeting_mode FROM meeting_participants mp
+         JOIN meetings m ON m.id = mp.meeting_id
+         WHERE mp.user_id = $1 AND DATE(m.scheduled_at) = $2
+         LIMIT 1`,
+        [user.id, today]
+    );
+
+    const mode = sess.rows[0]?.meeting_mode || 'solo';
+    const photo = msg.photo[msg.photo.length - 1];
+    const caption = msg.caption || null;
+
+    await addToArchive(mode, caption, photo.file_id);
+    await query(
+        `UPDATE meeting_participants SET photo_received = TRUE
+         WHERE user_id = $1 AND meeting_id IN (
+           SELECT id FROM meetings WHERE DATE(scheduled_at) = $2
+         )`,
+        [user.id, today]
+    );
+
+    await send(chatId, `📷 Фото отримано. Йде в архів.`);
+});
+
+// ============================================================
+// BOT — /status (адмін)
+// ============================================================
+
+bot.onText(/\/status/, async (msg) => {
+    const today = new Date().toISOString().split('T')[0];
+    const intents = await query(
+        `SELECT COUNT(*) FROM join_intents WHERE slot_date = $1`, [today]
+    );
+    const { counts } = await getArchiveSummary();
+
+    await send(msg.chat.id,
+        `*Статус точки ${today}*\n\n` +
+        `Записалось: ${intents.rows[0].count}\n` +
+        `Архів разом: ${counts.together || 0} фото\n` +
+        `Архів сам: ${counts.solo || 0} фото\n` +
+        `Точка: ${slotTimeStr()}, ${LOCATION}`
+    );
+});
+
+bot.onText(/\/archive/, async (msg) => {
+    bot.emit('callback_query', {
+        id: 'cmd', message: { chat: msg.chat }, from: msg.from, data: 'archive'
+    });
+});
+
+// ============================================================
+// API ENDPOINTS (залишаємо для сумісності)
 // ============================================================
 
 app.get('/feed', async (req, res) => {
@@ -74,141 +465,19 @@ app.get('/feed', async (req, res) => {
         );
         res.json({ meetings: feed.rows });
     } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: 'Server error' });
-    }
-});
-
-app.post('/join', async (req, res) => {
-    const { userId, meetingId } = req.body;
-    const client = await pool.connect();
-    try {
-        await client.query('BEGIN');
-        const meetingResult = await client.query(`SELECT * FROM meetings WHERE id = $1 FOR UPDATE`, [meetingId]);
-        const meeting = meetingResult.rows[0];
-        if (!meeting || !['open', 'partial'].includes(meeting.status)) {
-            await client.query('ROLLBACK');
-            return res.status(400).json({ error: 'Meeting not available' });
-        }
-        const countResult = await client.query(`SELECT COUNT(*) FROM meeting_participants WHERE meeting_id = $1`, [meetingId]);
-        const count = parseInt(countResult.rows[0].count);
-        if (count >= 3) {
-            await client.query('ROLLBACK');
-            return res.status(400).json({ error: 'Meeting is full' });
-        }
-        await client.query(`INSERT INTO meeting_participants (id, meeting_id, user_id) VALUES ($1, $2, $3)`, [uuidv4(), meetingId, userId]);
-        const newStatus = count === 0 ? 'partial' : 'matched';
-        await client.query(`UPDATE meetings SET status = $1 WHERE id = $2`, [newStatus, meetingId]);
-        await client.query('COMMIT');
-        res.json({ status: newStatus });
-    } catch (err) {
-        await client.query('ROLLBACK');
-        res.status(500).json({ error: 'Server error' });
-    } finally {
-        client.release();
-    }
-});
-
-app.post('/checkin', async (req, res) => {
-    const { userId, meetingId } = req.body;
-    const client = await pool.connect();
-    try {
-        await client.query('BEGIN');
-        await client.query(
-            `UPDATE meeting_participants SET checkin_status = 'checked_in', checked_in_at = NOW() WHERE user_id = $1 AND meeting_id = $2`,
-            [userId, meetingId]
-        );
-        await logEvent(client, { userId, meetingId, eventType: 'checkin' });
-        const checkedIn = await client.query(`SELECT COUNT(*) FROM meeting_participants WHERE meeting_id = $1 AND checkin_status = 'checked_in'`, [meetingId]);
-        const total = await client.query(`SELECT COUNT(*) FROM meeting_participants WHERE meeting_id = $1`, [meetingId]);
-        if (parseInt(checkedIn.rows[0].count) === parseInt(total.rows[0].count)) {
-            await client.query(`UPDATE meetings SET status = 'active' WHERE id = $1`, [meetingId]);
-        }
-        await client.query('COMMIT');
-        res.json({ ok: true });
-    } catch (err) {
-        await client.query('ROLLBACK');
-        res.status(500).json({ error: 'Server error' });
-    } finally {
-        client.release();
-    }
-});
-
-app.post('/leave', async (req, res) => {
-    const { userId, meetingId, blockNumber, timeSpent } = req.body;
-    const client = await pool.connect();
-    try {
-        await client.query('BEGIN');
-        await client.query(`UPDATE meeting_participants SET left_at = NOW() WHERE user_id = $1 AND meeting_id = $2`, [userId, meetingId]);
-        await logEvent(client, { userId, meetingId, eventType: 'abandon', metadata: { block_number: blockNumber, time_spent: timeSpent } });
-        await changeDp(client, userId, 20, 'abandon');
-        const remaining = await client.query(`SELECT user_id FROM meeting_participants WHERE meeting_id = $1 AND left_at IS NULL AND user_id != $2`, [meetingId, userId]);
-        if (remaining.rows.length === 0) {
-            await client.query(`UPDATE meetings SET status = 'abandoned' WHERE id = $1`, [meetingId]);
-        }
-        await client.query('COMMIT');
-        res.json({ ok: true });
-    } catch (err) {
-        await client.query('ROLLBACK');
-        res.status(500).json({ error: 'Server error' });
-    } finally {
-        client.release();
-    }
-});
-
-app.post('/complete', async (req, res) => {
-    const { userId, meetingId } = req.body;
-    const client = await pool.connect();
-    try {
-        await client.query('BEGIN');
-        const result = await client.query(`UPDATE meetings SET status = 'completed' WHERE id = $1 AND status != 'completed' RETURNING id`, [meetingId]);
-        if (result.rowCount === 0) {
-            await client.query('ROLLBACK');
-            return res.json({ ok: true, alreadyCompleted: true });
-        }
-        const participants = await client.query(`SELECT user_id FROM meeting_participants WHERE meeting_id = $1 AND left_at IS NULL`, [meetingId]);
-        for (const p of participants.rows) {
-            await changeDp(client, p.user_id, 50, 'complete');
-            await client.query(`UPDATE users SET meetings_completed = meetings_completed + 1, trust_score = LEAST(trust_score + 0.02, 1.5) WHERE id = $1`, [p.user_id]);
-            await logEvent(client, { userId: p.user_id, meetingId, eventType: 'complete' });
-            await client.query(
-                `INSERT INTO feedback (id, meeting_id, user_id, sent_at) VALUES ($1, $2, $3, NOW() + INTERVAL '30 minutes') ON CONFLICT (meeting_id, user_id) DO NOTHING`,
-                [uuidv4(), meetingId, p.user_id]
-            );
-        }
-        await client.query('COMMIT');
-        res.json({ ok: true });
-    } catch (err) {
-        await client.query('ROLLBACK');
-        res.status(500).json({ error: 'Server error' });
-    } finally {
-        client.release();
-    }
-});
-
-app.post('/feedback', async (req, res) => {
-    const { userId, meetingId, experience, comfort, reason } = req.body;
-    try {
-        await query(`UPDATE feedback SET experience=$1, comfort=$2, reason=$3, answered_at=NOW() WHERE user_id=$4 AND meeting_id=$5`, [experience, comfort, reason || null, userId, meetingId]);
-        if (comfort === 'no' && reason) {
-            await query(`INSERT INTO reports (id, reporter_id, meeting_id, reason) VALUES ($1, $2, $3, $4)`, [uuidv4(), userId, meetingId, reason]);
-            const other = await query(`SELECT user_id FROM meeting_participants WHERE meeting_id = $1 AND user_id != $2`, [meetingId, userId]);
-            if (other.rows.length > 0) {
-                await query(`UPDATE users SET trust_score = GREATEST(trust_score - 0.1, 0) WHERE id = $1`, [other.rows[0].user_id]);
-            }
-        }
-        res.json({ ok: true });
-    } catch (err) {
         res.status(500).json({ error: 'Server error' });
     }
 });
 
 app.post('/users', async (req, res) => {
-    const { telegramId, username, ageGroup, currentState } = req.body;
+    const { telegramId, username } = req.body;
     try {
         const result = await query(
-            `INSERT INTO users (id, telegram_id, username, age_group, current_state) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (telegram_id) DO UPDATE SET username = EXCLUDED.username RETURNING *`,
-            [uuidv4(), telegramId, username, ageGroup, currentState]
+            `INSERT INTO users (id, telegram_id, username)
+             VALUES ($1, $2, $3)
+             ON CONFLICT (telegram_id) DO UPDATE SET username = EXCLUDED.username
+             RETURNING *`,
+            [uuidv4(), String(telegramId), username]
         );
         res.json(result.rows[0]);
     } catch (err) {
@@ -219,7 +488,7 @@ app.post('/users', async (req, res) => {
 app.get('/users', async (req, res) => {
     try {
         const { telegramId } = req.query;
-        const result = await query(`SELECT * FROM users WHERE telegram_id = $1`, [telegramId]);
+        const result = await query(`SELECT * FROM users WHERE telegram_id = $1`, [String(telegramId)]);
         if (!result.rows.length) return res.status(404).json({ error: 'Not found' });
         res.json(result.rows[0]);
     } catch (err) {
@@ -227,168 +496,223 @@ app.get('/users', async (req, res) => {
     }
 });
 
-app.get('/users/:id/dp', async (req, res) => {
+app.post('/feedback', async (req, res) => {
+    const { userId, meetingId, experience, comfort, reason } = req.body;
     try {
-        const result = await query(`SELECT dp FROM users WHERE id = $1`, [req.params.id]);
-        if (!result.rows.length) return res.status(404).json({ error: 'Not found' });
-        res.json({ dp: result.rows[0].dp });
+        await query(
+            `UPDATE feedback SET experience=$1, comfort=$2, reason=$3, answered_at=NOW()
+             WHERE user_id=$4 AND meeting_id=$5`,
+            [experience, comfort, reason || null, userId, meetingId]
+        );
+        if (comfort === 'no' && reason) {
+            await query(
+                `INSERT INTO reports (id, reporter_id, meeting_id, reason) VALUES ($1, $2, $3, $4)`,
+                [uuidv4(), userId, meetingId, reason]
+            );
+        }
+        res.json({ ok: true });
     } catch (err) {
         res.status(500).json({ error: 'Server error' });
     }
 });
 
+app.get('/health', (req, res) => res.json({ ok: true }));
+
 // ============================================================
-// BOT HANDLERS
+// WORKER ENTRY — матчинг + нагадування + завдання + закриття
+// Викликається воркером кожну хвилину через /worker/tick
 // ============================================================
 
-const onboarding = {};
+app.post('/worker/tick', async (req, res) => {
+    const secret = req.headers['x-worker-secret'];
+    if (secret !== process.env.WORKER_SECRET) return res.status(403).json({ error: 'Forbidden' });
 
-bot.onText(/\/start/, async (msg) => {
-    const chatId = msg.chat.id;
-    const telegramId = msg.from.id;
-    const username = msg.from.username || msg.from.first_name;
-    onboarding[chatId] = { telegramId, username };
-    await bot.sendMessage(chatId,
-        'Doto — задания в парке или библиотеке.\nДля студентов и тех кому 18–25.\n\nНикакого знакомства если не хочешь — просто оказаться рядом пока делаешь что-то.',
-        { reply_markup: { inline_keyboard: [[{ text: 'Попробовать', callback_data: 'onboard:state' }]] } }
-    );
-});
+    const now = new Date();
+    const h = now.getHours();
+    const m = now.getMinutes();
+    const today = now.toISOString().split('T')[0];
 
-bot.onText(/\/tasks/, async (msg) => {
-    const chatId = msg.chat.id;
-    const result = await query(`SELECT id FROM users WHERE telegram_id = $1`, [msg.from.id]);
-    if (!result.rows.length) return bot.sendMessage(chatId, 'Сначала зарегистрируйся — нажми /start');
-    const feed = await query(
-        `SELECT m.*, t.title, t.description FROM meetings m JOIN tasks t ON t.id = m.task_id WHERE m.status IN ('open','partial') AND m.scheduled_at > NOW() LIMIT 3`
-    );
-    if (!feed.rows.length) return bot.sendMessage(chatId, 'Сейчас встреч нет. Загляни через пару часов.');
-    for (const m of feed.rows) {
-        const date = new Date(m.scheduled_at).toLocaleString('ru-RU');
-        await bot.sendMessage(chatId,
-            `📍 ${m.location_name || 'Место встречи'}\n\n${m.description || m.title}\n\n${date} · 👥 Небольшая встреча`,
-            { reply_markup: { inline_keyboard: [[{ text: 'Иду', callback_data: `join:${m.id}` }, { text: 'Другой вариант', callback_data: 'show_feed' }]] } }
+    // За 15 хв: нагадування
+    if (h === SLOT_HOUR && m === SLOT_MIN - 15) {
+        const intents = await query(
+            `SELECT ji.*, u.telegram_id FROM join_intents ji
+             JOIN users u ON u.id = ji.user_id
+             WHERE ji.slot_date = $1`, [today]
         );
-    }
-});
-
-bot.onText(/\/dp/, async (msg) => {
-    const result = await query(`SELECT dp FROM users WHERE telegram_id = $1`, [msg.from.id]);
-    if (!result.rows.length) return;
-    bot.sendMessage(msg.chat.id, `Твой баланс: ${result.rows[0].dp} DP`);
-});
-
-bot.on('callback_query', async (q) => {
-    const chatId = q.message.chat.id;
-    const data = q.data;
-    const telegramId = q.from.id;
-    await bot.answerCallbackQuery(q.id);
-
-    if (data === 'onboard:state') {
-        await bot.sendMessage(chatId, 'Как ты видишь эту встречу?', { reply_markup: { inline_keyboard: [
-            [{ text: '❤️ Можно почти не разговаривать', callback_data: 'state:calm' }],
-            [{ text: '🙂 Немного общения', callback_data: 'state:neutral' }],
-            [{ text: '⚡ Более живой формат', callback_data: 'state:active' }]
-        ] } });
-    }
-
-    if (data.startsWith('state:')) {
-        const state = data.split(':')[1];
-        onboarding[chatId] = { ...onboarding[chatId], state };
-        await bot.sendMessage(chatId, 'Тебе ближе:', { reply_markup: { inline_keyboard: [
-            [{ text: '🎓 студент (18–21)', callback_data: 'age:student' }],
-            [{ text: '🧑 уже работаю (22–25)', callback_data: 'age:early_work' }]
-        ] } });
-    }
-
-    if (data.startsWith('age:')) {
-        const ageGroup = data.split(':')[1];
-        const ob = onboarding[chatId] || {};
-        const result = await query(
-            `INSERT INTO users (id, telegram_id, username, age_group, current_state) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (telegram_id) DO UPDATE SET username = EXCLUDED.username RETURNING *`,
-            [uuidv4(), telegramId, ob.username, ageGroup, ob.state]
-        );
-        onboarding[chatId] = { ...ob, userId: result.rows[0].id };
-        await bot.sendMessage(chatId, 'Готово. Покажу ближайшие встречи.',
-            { reply_markup: { inline_keyboard: [[{ text: 'Смотреть встречи', callback_data: 'show_feed' }]] } }
-        );
-    }
-
-    if (data === 'show_feed') {
-        const feed = await query(
-            `SELECT m.*, t.title, t.description FROM meetings m JOIN tasks t ON t.id = m.task_id WHERE m.status IN ('open','partial') AND m.scheduled_at > NOW() LIMIT 3`
-        );
-        if (!feed.rows.length) return bot.sendMessage(chatId, 'Сейчас встреч нет. Загляни через пару часов.');
-        for (const m of feed.rows) {
-            const date = new Date(m.scheduled_at).toLocaleString('ru-RU');
-            await bot.sendMessage(chatId,
-                `📍 ${m.location_name || 'Место встречи'}\n\n${m.description || m.title}\n\n${date} · 👥 Небольшая встреча`,
-                { reply_markup: { inline_keyboard: [[{ text: 'Иду', callback_data: `join:${m.id}` }, { text: 'Другой вариант', callback_data: 'show_feed' }]] } }
-            );
+        for (const i of intents.rows) {
+            try {
+                await send(i.telegram_id,
+                    `⏰ Точка відкриється через 15 хвилин.\n\n` +
+                    `${LOCATION}.\n\n` +
+                    `Якщо поруч буде ще хтось — ви зробите завдання разом.\n` +
+                    `Якщо ні — точка працює в тихому режимі.`
+                );
+            } catch (e) { console.error('reminder error', e.message); }
         }
     }
 
-    if (data.startsWith('join:')) {
-        const meetingId = data.split(':')[1];
-        const userRes = await query(`SELECT id FROM users WHERE telegram_id = $1`, [telegramId]);
-        if (!userRes.rows.length) return;
-        const userId = userRes.rows[0].id;
-        const client = await pool.connect();
-        try {
-            await client.query('BEGIN');
-            const m = await client.query(`SELECT * FROM meetings WHERE id = $1 FOR UPDATE`, [meetingId]);
-            if (!m.rows.length || !['open', 'partial'].includes(m.rows[0].status)) {
-                await client.query('ROLLBACK');
-                return bot.sendMessage(chatId, 'Место уже занято. Попробуй другую встречу.');
+    // О SLOT_HOUR:SLOT_MIN — видаємо завдання + матчимо
+    if (h === SLOT_HOUR && m === SLOT_MIN) {
+        const intents = await query(
+            `SELECT ji.*, u.telegram_id, u.meetings_completed
+             FROM join_intents ji
+             JOIN users u ON u.id = ji.user_id
+             WHERE ji.slot_date = $1 AND ji.task_sent = FALSE`,
+            [today]
+        );
+
+        const users = intents.rows;
+        const pairs = [];
+        const solos = [];
+
+        for (let i = 0; i + 1 < users.length; i += 2) {
+            pairs.push([users[i], users[i + 1]]);
+        }
+        if (users.length % 2 !== 0) solos.push(users[users.length - 1]);
+
+        // Пари
+        for (const [a, b] of pairs) {
+            const task = pickTask(Math.min(a.meetings_completed, b.meetings_completed) + 1, true);
+            for (const u of [a, b]) {
+                try {
+                    await send(u.telegram_id, `*Завдання:*\n\n${task.text}`);
+                    await query(
+                        `UPDATE join_intents SET task_sent = TRUE, task_type = $1, meeting_mode = 'together'
+                         WHERE user_id = $2 AND slot_date = $3`,
+                        [task.type, u.user_id, today]
+                    );
+                    await query(`UPDATE users SET meetings_completed = meetings_completed + 1 WHERE id = $1`, [u.user_id]);
+                } catch (e) { console.error('task pair error', e.message); }
             }
-            const cnt = await client.query(`SELECT COUNT(*) FROM meeting_participants WHERE meeting_id = $1`, [meetingId]);
-            if (parseInt(cnt.rows[0].count) >= 3) {
-                await client.query('ROLLBACK');
-                return bot.sendMessage(chatId, 'Место уже занято.');
+        }
+
+        // Сольні
+        for (const u of solos) {
+            const task = pickTask(u.meetings_completed + 1, false);
+            try {
+                await send(u.telegram_id, `*Завдання:*\n\n${task.text}`);
+                await query(
+                    `UPDATE join_intents SET task_sent = TRUE, task_type = $1, meeting_mode = 'solo'
+                     WHERE user_id = $2 AND slot_date = $3`,
+                    [task.type, u.user_id, today]
+                );
+                await query(`UPDATE users SET meetings_completed = meetings_completed + 1 WHERE id = $1`, [u.user_id]);
+            } catch (e) { console.error('task solo error', e.message); }
+        }
+
+        // Notify-next users
+        const notifyUsers = await query(
+            `SELECT telegram_id FROM users WHERE notify_next = TRUE`
+        );
+        for (const u of notifyUsers.rows) {
+            if (!users.find(i => i.telegram_id === u.telegram_id)) {
+                try {
+                    await send(u.telegram_id,
+                        `🌿 Точка зараз відкрита!\n\n${slotTimeStr()}, ${LOCATION}.\n\nХочеш зайти?`,
+                        kbd([[{ text: '🌿 Хочу зайти', callback_data: 'join' }]])
+                    );
+                    await query(`UPDATE users SET notify_next = FALSE WHERE telegram_id = $1`, [u.telegram_id]);
+                } catch (e) {}
             }
-            await client.query(`INSERT INTO meeting_participants (id, meeting_id, user_id) VALUES ($1, $2, $3)`, [uuidv4(), meetingId, userId]);
-            const newStatus = parseInt(cnt.rows[0].count) === 0 ? 'partial' : 'matched';
-            await client.query(`UPDATE meetings SET status = $1 WHERE id = $2`, [newStatus, meetingId]);
-            await client.query('COMMIT');
-            await bot.sendMessage(chatId, 'Ты записан.\n\nНичего готовить не нужно. Просто приди.');
-        } catch (e) {
-            await client.query('ROLLBACK');
-            bot.sendMessage(chatId, 'Что-то пошло не так. Попробуй ещё раз.');
-        } finally {
-            client.release();
         }
     }
 
-    if (data.startsWith('feedback:')) {
-        const [, meetingId, experience] = data.split(':');
-        const userRes = await query(`SELECT id FROM users WHERE telegram_id = $1`, [telegramId]);
-        if (!userRes.rows.length) return;
-        await query(`UPDATE feedback SET experience=$1, answered_at=NOW() WHERE user_id=$2 AND meeting_id=$3`, [experience, userRes.rows[0].id, meetingId]);
-        await bot.sendMessage(chatId, 'Спасибо.');
-    }
+    // +20 хв: закриття точки
+    const closeH = SLOT_HOUR + Math.floor((SLOT_MIN + 20) / 60);
+    const closeM = (SLOT_MIN + 20) % 60;
 
-    if (data.startsWith('comfort:')) {
-        const [, meetingId, comfort] = data.split(':');
-        const userRes = await query(`SELECT id FROM users WHERE telegram_id = $1`, [telegramId]);
-        if (!userRes.rows.length) return;
-        if (comfort === 'no') {
-            await bot.sendMessage(chatId, 'Что было не так?', { reply_markup: { inline_keyboard: [
-                [{ text: 'Не мой возраст', callback_data: `reason:${meetingId}:age` }],
-                [{ text: 'Некомфортное поведение', callback_data: `reason:${meetingId}:behavior` }],
-                [{ text: 'Другое', callback_data: `reason:${meetingId}:other` }]
-            ] } });
-        } else {
-            await query(`UPDATE feedback SET comfort=$1 WHERE user_id=$2 AND meeting_id=$3`, [comfort, userRes.rows[0].id, meetingId]);
-            await bot.sendMessage(chatId, 'Хорошо.');
+    if (h === closeH && m === closeM) {
+        const intents = await query(
+            `SELECT ji.*, u.telegram_id FROM join_intents ji
+             JOIN users u ON u.id = ji.user_id
+             WHERE ji.slot_date = $1 AND ji.task_sent = TRUE AND ji.closed = FALSE`,
+            [today]
+        );
+        for (const i of intents.rows) {
+            try {
+                const isSolo = i.meeting_mode === 'solo';
+                let text = `Точка закривається.\n\nМожна піти. Можна сидіти ще. Немає правила.`;
+                if (isSolo) {
+                    text += `\n\nТвоє фото в архіві сам.\nНаступна людина побачить його перед тим, як зайти.`;
+                }
+                text += `\n\nЧерез 2 години надішлемо 3 коротких питання.`;
+                await send(i.telegram_id, text);
+                await query(
+                    `UPDATE join_intents SET closed = TRUE WHERE user_id = $1 AND slot_date = $2`,
+                    [i.user_id, today]
+                );
+            } catch (e) { console.error('close error', e.message); }
         }
     }
 
-    if (data.startsWith('reason:')) {
-        const [, meetingId, reason] = data.split(':');
-        const userRes = await query(`SELECT id FROM users WHERE telegram_id = $1`, [telegramId]);
-        if (!userRes.rows.length) return;
-        await query(`UPDATE feedback SET comfort='no', reason=$1 WHERE user_id=$2 AND meeting_id=$3`, [reason, userRes.rows[0].id, meetingId]);
-        await bot.sendMessage(chatId, 'Понял. Учтём.');
+    // +2 год 20 хв: фідбек
+    const feedH = closeH + 2;
+    const feedM = closeM;
+
+    if (h === feedH && m === feedM) {
+        const intents = await query(
+            `SELECT ji.*, u.telegram_id FROM join_intents ji
+             JOIN users u ON u.id = ji.user_id
+             WHERE ji.slot_date = $1 AND ji.closed = TRUE AND ji.feedback_sent = FALSE`,
+            [today]
+        );
+        for (const i of intents.rows) {
+            try {
+                await send(i.telegram_id,
+                    `Як ти себе почуваєш?`,
+                    kbd([[
+                        { text: '1', callback_data: 'mood_1' },
+                        { text: '2', callback_data: 'mood_2' },
+                        { text: '3', callback_data: 'mood_3' },
+                        { text: '4', callback_data: 'mood_4' },
+                        { text: '5', callback_data: 'mood_5' },
+                    ]])
+                );
+                await query(
+                    `UPDATE join_intents SET feedback_sent = TRUE WHERE user_id = $1 AND slot_date = $2`,
+                    [i.user_id, today]
+                );
+            } catch (e) { console.error('feedback error', e.message); }
+        }
+
+        // Асиметричний фідбек партнерів
+        const paired = await query(
+            `SELECT ji1.user_id as uid1, u1.telegram_id as tg1,
+                    ji2.user_id as uid2, u2.telegram_id as tg2
+             FROM join_intents ji1
+             JOIN join_intents ji2 ON ji2.slot_date = ji1.slot_date
+               AND ji2.partner_id = ji1.user_id
+             JOIN users u1 ON u1.id = ji1.user_id
+             JOIN users u2 ON u2.id = ji2.user_id
+             WHERE ji1.slot_date = $1
+               AND ji1.meeting_mode = 'together'
+               AND (ji1.feedback_return = TRUE OR ji2.feedback_return = TRUE)
+               AND ji1.partner_notified = FALSE`,
+            [today]
+        );
+
+        for (const pair of paired.rows) {
+            const msg =
+                `Хтось із вас хоче ще.\n\n` +
+                `Якщо обидва натиснете "Разом" — наступна точка разом.\n` +
+                `Якщо ні — підберемо нових партнерів. Без пояснень.`;
+            const pKbd = kbd([[
+                { text: 'Разом', callback_data: 'partner_together' },
+                { text: 'Новий', callback_data: 'partner_new' },
+            ]]);
+            try {
+                await send(pair.tg1, msg, pKbd);
+                await send(pair.tg2, msg, pKbd);
+                await query(
+                    `UPDATE join_intents SET partner_notified = TRUE
+                     WHERE user_id IN ($1, $2) AND slot_date = $3`,
+                    [pair.uid1, pair.uid2, today]
+                );
+            } catch (e) {}
+        }
     }
+
+    res.json({ ok: true });
 });
 
 // ============================================================
@@ -398,6 +722,5 @@ bot.on('callback_query', async (q) => {
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, async () => {
     console.log(`Doto API running on port ${PORT}`);
-    console.log('Doto Bot attached to API process');
     await setWebhook();
 });
