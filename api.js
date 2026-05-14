@@ -1,28 +1,44 @@
 // ============================================================
 // DOTO — API + BOT (Express.js, webhook mode)
-// v1.4 — флоу без анкет. Архів разом / сам. Solo-режим.
+// v1.9 — виправлено: slotDateForHour логіка, feedH % 24,
+//         polling вимкнено (більше немає дублювання апдейтів)
 // ============================================================
 
 const express = require('express');
 const { Pool } = require('pg');
 const { v4: uuidv4 } = require('uuid');
 const TelegramBot = require('node-telegram-bot-api');
+const { DateTime } = require('luxon');
 
 const app = express();
 app.use(express.json());
 
+if (!process.env.DATABASE_URL) {
+    console.error('DATABASE_URL не встановлений. Зупинка.');
+    process.exit(1);
+}
+if (!process.env.TELEGRAM_TOKEN) {
+    console.error('TELEGRAM_TOKEN не встановлений. Зупинка.');
+    process.exit(1);
+}
+
 const pool = new Pool({
-    connectionString: process.env.DATABASE_URL || 'postgresql://postgres.kcdedrgylmxczjijoncx:DotoData2069@aws-1-eu-central-2.pooler.supabase.com:5432/postgres',
+    connectionString: process.env.DATABASE_URL,
     ssl: { rejectUnauthorized: false }
 });
 
-const TOKEN = process.env.TELEGRAM_TOKEN;
-const APP_URL = process.env.APP_URL || 'https://doto-6zi6.onrender.com';
+const TOKEN    = process.env.TELEGRAM_TOKEN;
+const APP_URL  = process.env.APP_URL  || 'https://doto-6zi6.onrender.com';
 const LOCATION = process.env.LOCATION || 'парк Шевченка, фонтан';
 const SLOT_HOUR = parseInt(process.env.SLOT_HOUR || '18');
-const SLOT_MIN = parseInt(process.env.SLOT_MIN || '30');
+const SLOT_MIN  = parseInt(process.env.SLOT_MIN  || '30');
+const CITY_TZ   = process.env.CITY_TZ || 'Europe/Kyiv';
 
-const bot = new TelegramBot(TOKEN, { webHook: false });
+// БАГ ВИПРАВЛЕНО: { polling: false } замість { webHook: false }
+// webHook: false запускав polling (постійний GET до Telegram API)
+// одночасно з нашим Express webhook — дублювання апдейтів.
+// Правильно: polling: false = тільки webhook через Express.
+const bot = new TelegramBot(TOKEN, { polling: false });
 
 async function setWebhook() {
     try {
@@ -51,28 +67,73 @@ async function query(sql, params) {
     }
 }
 
+function kyivNow() {
+    return DateTime.now().setZone(CITY_TZ);
+}
+
+function localToday() {
+    return kyivNow().toISODate();
+}
+
 function slotTimeStr() {
     return `${String(SLOT_HOUR).padStart(2,'0')}:${String(SLOT_MIN).padStart(2,'0')}`;
 }
 
-function send(chatId, text, opts = {}) {
-    return bot.sendMessage(chatId, text, { parse_mode: 'Markdown', ...opts });
+// БАГ ВИПРАВЛЕНО: попередня логіка з diff > 6 давала фантомні дати
+// якщо поточний час менший за час слоту (слот "ще попереду" сьогодні,
+// але насправді він вже вчора).
+// Правильна логіка: якщо зараз ДО часу слоту — слот ще не настав сьогодні,
+// тобто активний слот — вчорашній.
+function slotDateForHour(slotH) {
+    const now = kyivNow();
+    const todaySlotDt = now.set({ hour: slotH, minute: SLOT_MIN, second: 0, millisecond: 0 });
+    if (now < todaySlotDt) {
+        // Зараз раніше ніж час слоту — поточний активний слот вчора
+        return now.minus({ days: 1 }).toISODate();
+    }
+    return now.toISODate();
+}
+
+// Обчислює DateTime закриття і фідбеку через Luxon — без ручного modulo
+// БАГ ВИПРАВЛЕНО: feedH % 24 змішував години і хвилини,
+// через що фідбек о 00:xx не приходив
+function getSlotTimings() {
+    const now = kyivNow();
+    const slotDate = slotDateForHour(SLOT_HOUR);
+
+    // Будуємо DateTime слоту на правильній даті
+    const slotDt = DateTime.fromISO(slotDate, { zone: CITY_TZ })
+        .set({ hour: SLOT_HOUR, minute: SLOT_MIN, second: 0 });
+
+    const closeDt  = slotDt.plus({ minutes: 20 });
+    const feedDt   = closeDt.plus({ hours: 2 });
+    const remDt    = slotDt.minus({ minutes: 15 });
+
+    return { now, slotDate, slotDt, closeDt, feedDt, remDt };
+}
+
+// Перевіряє чи поточний час в вікні [target - before, target + after] хвилин
+function inWindow(now, targetDt, beforeMin, afterMin) {
+    const diffMin = now.diff(targetDt, 'minutes').minutes;
+    return diffMin >= -beforeMin && diffMin <= afterMin;
+}
+
+async function send(telegramId, text, opts = {}) {
+    try {
+        return await bot.sendMessage(telegramId, text, { parse_mode: 'Markdown', ...opts });
+    } catch (e) {
+        if (e.response?.statusCode === 403 || (e.message && e.message.includes('blocked'))) {
+            await query(
+                `UPDATE users SET blocked = TRUE WHERE telegram_id = $1`,
+                [String(telegramId)]
+            ).catch(() => {});
+        }
+        console.error(`send failed for ${telegramId}:`, e.message);
+    }
 }
 
 function kbd(rows) {
     return { reply_markup: { inline_keyboard: rows } };
-}
-
-async function logEvent(client, { userId, meetingId, eventType, metadata = {} }) {
-    await client.query(
-        `INSERT INTO events (id, user_id, meeting_id, event_type, metadata) VALUES ($1, $2, $3, $4, $5)`,
-        [uuidv4(), userId, meetingId, eventType, JSON.stringify(metadata)]
-    );
-}
-
-async function changeDp(client, userId, amount, reason) {
-    await client.query(`UPDATE users SET dp = dp + $1 WHERE id = $2`, [amount, userId]);
-    await client.query(`INSERT INTO dp_log (id, user_id, change, reason) VALUES ($1, $2, $3, $4)`, [uuidv4(), userId, amount, reason]);
 }
 
 async function getUser(telegramId) {
@@ -80,14 +141,10 @@ async function getUser(telegramId) {
     return r.rows[0] || null;
 }
 
-async function getTodaySession(userId) {
-    const today = new Date().toISOString().split('T')[0];
+async function getIntent(userId, slotDate) {
     const r = await query(
-        `SELECT * FROM meeting_participants mp
-         JOIN meetings m ON m.id = mp.meeting_id
-         WHERE mp.user_id = $1 AND DATE(m.scheduled_at) = $2
-         LIMIT 1`,
-        [userId, today]
+        `SELECT * FROM join_intents WHERE user_id = $1 AND slot_date = $2`,
+        [userId, slotDate]
     );
     return r.rows[0] || null;
 }
@@ -97,32 +154,41 @@ async function getTodaySession(userId) {
 // ============================================================
 
 const TASKS = {
-    A: [
+    absurd: [
         'Знайди жабку, яка дивиться як твій колишній о 3 ночі.\nСфоткай крупним планом. Надішли сюди. Без слів.',
         'Знайди дерево, яке ходить до психолога вже третій рік.\nСфоткай так, щоб було видно його проблему.',
         'Знайди лавку, яка явно переживає розставання.\nСфоткай. Без підпису.',
     ],
-    B: [
+    ambient: [
         'Знайди місце, де хочеться говорити шепотом.\nПостій там 30 секунд.\nНадішли один емодзі, який описує повітря.',
         'Знайди щось, що виглядає так, ніби воно чекає вже дуже давно.\nСфоткай. Надішли. Без слів.',
         'Знайди місце в парку, де тихіше ніж скрізь.\nПостій хвилину. Надішли фото того, що побачив.',
     ],
-    C: [
+    coordination: [
         'Знайди тінь, яка схожа на тварину. Не кажи вголос, яку.\nСфоткай.\nЯкщо ви обидва вгадали одне й те саме — отримуєте несправжнє очко.',
         'Знайдіть разом щось, що явно не на своєму місці.\nОбидва фоткаєте. Надсилаєте сюди.',
     ],
-    SOLO: [
+    city_attention: [
         'Сьогодні точка тиха.\n\nЗнайди жабку, яка не хоче, щоб її знайшли.\nСфоткай так, ніби ти її спалив.\nНадішли. Вона йде в архів.',
         'Сьогодні точка тиха.\n\nЗнайди місце, де місто звучить так, ніби про тебе забуло.\nПостій там 20 секунд.\nСфоткай щось, повз що всі проходять.',
     ],
 };
 
-function pickTask(visitCount, hasParter) {
-    if (!hasParter) return { type: 'SOLO', text: TASKS.SOLO[Math.floor(Math.random() * TASKS.SOLO.length)] };
-    if (visitCount <= 1) return { type: 'A', text: TASKS.A[Math.floor(Math.random() * TASKS.A.length)] };
-    if (visitCount <= 4) return { type: 'B', text: TASKS.B[Math.floor(Math.random() * TASKS.B.length)] };
-    const pool = Math.random() < 0.5 ? TASKS.C : TASKS.B;
-    return { type: visitCount >= 5 ? 'C' : 'B', text: pool[Math.floor(Math.random() * pool.length)] };
+function pickTask(visitCount, hasPartner) {
+    if (!hasPartner) {
+        const p = TASKS.city_attention;
+        return { type: 'city_attention', text: p[Math.floor(Math.random() * p.length)] };
+    }
+    if (visitCount <= 1) {
+        const p = TASKS.absurd;
+        return { type: 'absurd', text: p[Math.floor(Math.random() * p.length)] };
+    }
+    if (visitCount <= 4) {
+        const p = TASKS.ambient;
+        return { type: 'ambient', text: p[Math.floor(Math.random() * p.length)] };
+    }
+    const p = Math.random() < 0.5 ? TASKS.coordination : TASKS.ambient;
+    return { type: visitCount >= 5 ? 'coordination' : 'ambient', text: p[Math.floor(Math.random() * p.length)] };
 }
 
 // ============================================================
@@ -136,19 +202,17 @@ async function getArchiveSummary() {
     const solo = await query(
         `SELECT caption FROM archive WHERE mode = 'solo' ORDER BY created_at DESC LIMIT 3`
     );
-    const counts = await query(
-        `SELECT mode, COUNT(*) as c FROM archive GROUP BY mode`
-    );
+    const counts = await query(`SELECT mode, COUNT(*) as c FROM archive GROUP BY mode`);
     const countMap = {};
     counts.rows.forEach(r => { countMap[r.mode] = parseInt(r.c); });
-
     return { together: together.rows, solo: solo.rows, counts: countMap };
 }
 
-async function addToArchive(mode, caption, fileId) {
+async function addToArchive({ slotDate, mode, caption, fileId, taskType, userId, intentId }) {
     await query(
-        `INSERT INTO archive (id, slot_date, mode, caption, file_id) VALUES ($1, $2, $3, $4, $5)`,
-        [uuidv4(), new Date().toISOString().split('T')[0], mode, caption, fileId || null]
+        `INSERT INTO archive (id, slot_date, mode, caption, file_id, task_type, user_id, join_intent_id, photo_sent_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())`,
+        [uuidv4(), slotDate, mode, caption, fileId || null, taskType || null, userId || null, intentId || null]
     );
 }
 
@@ -157,15 +221,14 @@ async function addToArchive(mode, caption, fileId) {
 // ============================================================
 
 bot.onText(/\/start/, async (msg) => {
-    const chatId = msg.chat.id;
+    const chatId     = msg.chat.id;
     const telegramId = String(msg.from.id);
-    const username = msg.from.username || msg.from.first_name || '';
+    const username   = msg.from.username || msg.from.first_name || '';
 
-    // Upsert user без анкет
     await query(
         `INSERT INTO users (id, telegram_id, username)
          VALUES ($1, $2, $3)
-         ON CONFLICT (telegram_id) DO UPDATE SET username = EXCLUDED.username`,
+         ON CONFLICT (telegram_id) DO UPDATE SET username = EXCLUDED.username, blocked = FALSE`,
         [uuidv4(), telegramId, username]
     );
 
@@ -186,17 +249,35 @@ bot.onText(/\/start/, async (msg) => {
 });
 
 // ============================================================
+// BOT — /helper
+// ============================================================
+
+bot.onText(/\/helper/, async (msg) => {
+    await query(`UPDATE users SET is_helper = TRUE WHERE telegram_id = $1`, [String(msg.from.id)]);
+    await send(msg.chat.id, `✦ Тебе додано як помічника точки. Дякуємо.`);
+});
+
+// ============================================================
 // BOT — callback_query
 // ============================================================
 
 bot.on('callback_query', async (q) => {
-    const chatId = q.message.chat.id;
+    const chatId     = q.message.chat.id;
     const telegramId = String(q.from.id);
-    const data = q.data;
+    const data       = q.data;
     await bot.answerCallbackQuery(q.id);
 
-    // ── JOIN ──
+    const slotDate = slotDateForHour(SLOT_HOUR);
+
     if (data === 'join') {
+        const user = await getUser(telegramId);
+        if (!user) return;
+        await query(
+            `INSERT INTO join_intents (id, user_id, slot_date)
+             VALUES ($1, $2, $3)
+             ON CONFLICT (user_id, slot_date) DO NOTHING`,
+            [uuidv4(), user.id, localToday()]
+        );
         await send(chatId,
             `Готово.\n\n` +
             `Нагадаємо за 15 хвилин до точки.\n\n` +
@@ -205,17 +286,6 @@ bot.on('callback_query', async (q) => {
             `І трохи настрою дивитися на світ дивно.`,
             kbd([[{ text: 'Ок', callback_data: 'ok_joined' }]])
         );
-
-        // Записуємо намір (meeting буде знайдено воркером при матчингу)
-        const user = await getUser(telegramId);
-        if (user) {
-            await query(
-                `INSERT INTO join_intents (id, user_id, slot_date, created_at)
-                 VALUES ($1, $2, $3, NOW())
-                 ON CONFLICT (user_id, slot_date) DO NOTHING`,
-                [uuidv4(), user.id, new Date().toISOString().split('T')[0]]
-            );
-        }
         return;
     }
 
@@ -224,141 +294,92 @@ bot.on('callback_query', async (q) => {
         return;
     }
 
-    // ── ARCHIVE ──
     if (data === 'archive') {
         const { together, solo, counts } = await getArchiveSummary();
-
         let text = `*Архів точки*\n\n`;
-
         if ((counts.together || 0) > 0) {
             text += `*Архів разом* — ${counts.together} фото:\n`;
             together.forEach(a => { text += `📷 ${a.caption || '…'}\n`; });
         } else {
             text += `*Архів разом* — поки порожній\n`;
         }
-
         text += `\n`;
-
         if ((counts.solo || 0) > 0) {
             text += `*Архів сам* — ${counts.solo} фото:\n`;
             solo.forEach(a => { text += `🌿 ${a.caption || '…'}\n`; });
         } else {
             text += `*Архів сам* — поки порожній\n`;
         }
-
         text += `\nНаступна точка: сьогодні ${slotTimeStr()}`;
-
         await send(chatId, text, kbd([[
             { text: '🔔 Нагадати мені', callback_data: 'notify_me' },
-            { text: '🌿 Хочу зайти', callback_data: 'join' },
+            { text: '🌿 Хочу зайти',   callback_data: 'join'      },
         ]]));
         return;
     }
 
-    // ── NOTIFY ME ──
     if (data === 'notify_me') {
         const user = await getUser(telegramId);
-        if (user) {
-            await query(`UPDATE users SET notify_next = TRUE WHERE id = $1`, [user.id]);
-        }
+        if (user) await query(`UPDATE users SET notify_next = TRUE WHERE id = $1`, [user.id]);
         await send(chatId, `Нагадаємо коли точка відкриється. ✦`);
         return;
     }
 
-    // ── FEEDBACK: MOOD ──
     if (data.startsWith('mood_')) {
         const mood = parseInt(data.split('_')[1]);
         const user = await getUser(telegramId);
-        const today = new Date().toISOString().split('T')[0];
         if (user) {
             await query(
-                `UPDATE meeting_participants SET feedback_mood = $1
-                 WHERE user_id = $2 AND meeting_id IN (
-                   SELECT id FROM meetings WHERE DATE(scheduled_at) = $3
-                 )`,
-                [mood, user.id, today]
+                `UPDATE join_intents SET feedback_mood = $1 WHERE user_id = $2 AND slot_date = $3`,
+                [mood, user.id, slotDate]
             );
         }
-        await send(chatId,
-            `Хочеш ще раз?`,
-            kbd([[
-                { text: 'Так', callback_data: 'return_yes' },
-                { text: 'Ні', callback_data: 'return_no' },
-            ]])
-        );
+        await send(chatId, `Хочеш ще раз?`, kbd([[
+            { text: 'Так', callback_data: 'return_yes' },
+            { text: 'Ні',  callback_data: 'return_no'  },
+        ]]));
         return;
     }
 
-    // ── FEEDBACK: RETURN ──
     if (data === 'return_yes' || data === 'return_no') {
         const wantsReturn = data === 'return_yes';
         const user = await getUser(telegramId);
-        const today = new Date().toISOString().split('T')[0];
         if (user) {
             await query(
-                `UPDATE meeting_participants SET feedback_return = $1
-                 WHERE user_id = $2 AND meeting_id IN (
-                   SELECT id FROM meetings WHERE DATE(scheduled_at) = $3
-                 )`,
-                [wantsReturn, user.id, today]
+                `UPDATE join_intents SET feedback_return = $1 WHERE user_id = $2 AND slot_date = $3`,
+                [wantsReturn, user.id, slotDate]
             );
         }
-        await send(chatId,
-            `Розказав комусь про те, що було?`,
-            kbd([[
-                { text: 'Так', callback_data: 'shared_yes' },
-                { text: 'Ні', callback_data: 'shared_no' },
-            ]])
-        );
+        await send(chatId, `Розказав комусь про те, що було?`, kbd([[
+            { text: 'Так', callback_data: 'shared_yes' },
+            { text: 'Ні',  callback_data: 'shared_no'  },
+        ]]));
         return;
     }
 
-    // ── FEEDBACK: SHARED ──
     if (data === 'shared_yes' || data === 'shared_no') {
         const shared = data === 'shared_yes';
         const user = await getUser(telegramId);
-        const today = new Date().toISOString().split('T')[0];
-
         let wantsReturn = false;
         let mode = 'solo';
 
         if (user) {
             await query(
-                `UPDATE meeting_participants SET feedback_shared = $1
-                 WHERE user_id = $2 AND meeting_id IN (
-                   SELECT id FROM meetings WHERE DATE(scheduled_at) = $3
-                 )`,
-                [shared, user.id, today]
+                `UPDATE join_intents SET feedback_shared = $1 WHERE user_id = $2 AND slot_date = $3`,
+                [shared, user.id, slotDate]
             );
-
-            const sess = await query(
-                `SELECT mp.feedback_return, mp.meeting_mode
-                 FROM meeting_participants mp
-                 JOIN meetings m ON m.id = mp.meeting_id
-                 WHERE mp.user_id = $1 AND DATE(m.scheduled_at) = $2
-                 LIMIT 1`,
-                [user.id, today]
-            );
-            if (sess.rows.length) {
-                wantsReturn = sess.rows[0].feedback_return;
-                mode = sess.rows[0].meeting_mode || 'solo';
+            const intent = await getIntent(user.id, slotDate);
+            if (intent) {
+                wantsReturn = intent.feedback_return;
+                mode = intent.meeting_mode || 'solo';
             }
         }
 
-        // Архівна картка — тільки якщо хоче повернутись АБО розказав
         if (wantsReturn || shared) {
-            if (mode === 'solo') {
-                await send(chatId,
-                    `Твоє фото в архіві сам точки.\n\n` +
-                    `Ти — частина дивної маленької історії.\n` +
-                    `Та, яку побачив ти.`
-                );
-            } else {
-                await send(chatId,
-                    `Твоє фото в архіві точки.\n\n` +
-                    `Ти — частина дивної маленької історії.`
-                );
-            }
+            const cardText = mode === 'solo'
+                ? `Твоє фото в архіві сам точки.\n\nТи — частина дивної маленької історії.\nТа, яку побачив ти.`
+                : `Твоє фото в архіві точки.\n\nТи — частина дивної маленької історії.`;
+            await send(chatId, cardText);
         }
 
         if (wantsReturn) {
@@ -372,71 +393,64 @@ bot.on('callback_query', async (q) => {
         return;
     }
 
-    // ── PARTNER CHOICE ──
-    if (data === 'partner_together') {
+    if (data === 'partner_together' || data === 'partner_new') {
         const user = await getUser(telegramId);
         if (user) await query(`UPDATE users SET notify_next = TRUE WHERE id = $1`, [user.id]);
-        await send(chatId, `Добре. Наступна точка — разом. Нагадаємо.`);
-        return;
-    }
-
-    if (data === 'partner_new') {
-        const user = await getUser(telegramId);
-        if (user) await query(`UPDATE users SET notify_next = TRUE WHERE id = $1`, [user.id]);
-        await send(chatId, `Підберемо нового партнера. Нагадаємо.`);
+        await send(chatId, data === 'partner_together'
+            ? `Добре. Наступна точка — разом. Нагадаємо.`
+            : `Підберемо нового партнера. Нагадаємо.`
+        );
         return;
     }
 });
 
 // ============================================================
-// BOT — фото від користувача → архів
+// BOT — фото → архів (перше фото на сесію)
 // ============================================================
 
 bot.on('photo', async (msg) => {
-    const chatId = msg.chat.id;
     const telegramId = String(msg.from.id);
-    const today = new Date().toISOString().split('T')[0];
-
+    const slotDate   = slotDateForHour(SLOT_HOUR);
     const user = await getUser(telegramId);
     if (!user) return;
 
-    const sess = await query(
-        `SELECT mp.meeting_mode FROM meeting_participants mp
-         JOIN meetings m ON m.id = mp.meeting_id
-         WHERE mp.user_id = $1 AND DATE(m.scheduled_at) = $2
-         LIMIT 1`,
-        [user.id, today]
-    );
+    const intent = await getIntent(user.id, slotDate);
+    if (!intent) return;
 
-    const mode = sess.rows[0]?.meeting_mode || 'solo';
+    // Приймаємо тільки перше фото — ігноруємо повторні
+    if (intent.photo_received) return;
+
     const photo = msg.photo[msg.photo.length - 1];
-    const caption = msg.caption || null;
 
-    await addToArchive(mode, caption, photo.file_id);
+    await addToArchive({
+        slotDate,
+        mode:     intent.meeting_mode || 'solo',
+        caption:  msg.caption || null,
+        fileId:   photo.file_id,
+        taskType: intent.task_type || null,
+        userId:   user.id,
+        intentId: intent.id,
+    });
+
     await query(
-        `UPDATE meeting_participants SET photo_received = TRUE
-         WHERE user_id = $1 AND meeting_id IN (
-           SELECT id FROM meetings WHERE DATE(scheduled_at) = $2
-         )`,
-        [user.id, today]
+        `UPDATE join_intents SET photo_received = TRUE, photo_sent_at = NOW()
+         WHERE user_id = $1 AND slot_date = $2`,
+        [user.id, slotDate]
     );
 
-    await send(chatId, `📷 Фото отримано. Йде в архів.`);
+    await send(msg.chat.id, `📷 Фото отримано. Йде в архів.`);
 });
 
 // ============================================================
-// BOT — /status (адмін)
+// BOT — /status
 // ============================================================
 
 bot.onText(/\/status/, async (msg) => {
-    const today = new Date().toISOString().split('T')[0];
-    const intents = await query(
-        `SELECT COUNT(*) FROM join_intents WHERE slot_date = $1`, [today]
-    );
+    const slotDate = localToday();
+    const intents  = await query(`SELECT COUNT(*) FROM join_intents WHERE slot_date = $1`, [slotDate]);
     const { counts } = await getArchiveSummary();
-
     await send(msg.chat.id,
-        `*Статус точки ${today}*\n\n` +
+        `*Статус точки ${slotDate}*\n\n` +
         `Записалось: ${intents.rows[0].count}\n` +
         `Архів разом: ${counts.together || 0} фото\n` +
         `Архів сам: ${counts.solo || 0} фото\n` +
@@ -451,247 +465,194 @@ bot.onText(/\/archive/, async (msg) => {
 });
 
 // ============================================================
-// API ENDPOINTS (залишаємо для сумісності)
-// ============================================================
-
-app.get('/feed', async (req, res) => {
-    try {
-        const feed = await query(
-            `SELECT m.*, t.title, t.description,
-             (SELECT COUNT(*) FROM meeting_participants mp WHERE mp.meeting_id = m.id) as participant_count
-             FROM meetings m JOIN tasks t ON t.id = m.task_id
-             WHERE m.status IN ('open','partial') AND m.scheduled_at > NOW()
-             LIMIT 5`
-        );
-        res.json({ meetings: feed.rows });
-    } catch (err) {
-        res.status(500).json({ error: 'Server error' });
-    }
-});
-
-app.post('/users', async (req, res) => {
-    const { telegramId, username } = req.body;
-    try {
-        const result = await query(
-            `INSERT INTO users (id, telegram_id, username)
-             VALUES ($1, $2, $3)
-             ON CONFLICT (telegram_id) DO UPDATE SET username = EXCLUDED.username
-             RETURNING *`,
-            [uuidv4(), String(telegramId), username]
-        );
-        res.json(result.rows[0]);
-    } catch (err) {
-        res.status(500).json({ error: 'Server error' });
-    }
-});
-
-app.get('/users', async (req, res) => {
-    try {
-        const { telegramId } = req.query;
-        const result = await query(`SELECT * FROM users WHERE telegram_id = $1`, [String(telegramId)]);
-        if (!result.rows.length) return res.status(404).json({ error: 'Not found' });
-        res.json(result.rows[0]);
-    } catch (err) {
-        res.status(500).json({ error: 'Server error' });
-    }
-});
-
-app.post('/feedback', async (req, res) => {
-    const { userId, meetingId, experience, comfort, reason } = req.body;
-    try {
-        await query(
-            `UPDATE feedback SET experience=$1, comfort=$2, reason=$3, answered_at=NOW()
-             WHERE user_id=$4 AND meeting_id=$5`,
-            [experience, comfort, reason || null, userId, meetingId]
-        );
-        if (comfort === 'no' && reason) {
-            await query(
-                `INSERT INTO reports (id, reporter_id, meeting_id, reason) VALUES ($1, $2, $3, $4)`,
-                [uuidv4(), userId, meetingId, reason]
-            );
-        }
-        res.json({ ok: true });
-    } catch (err) {
-        res.status(500).json({ error: 'Server error' });
-    }
-});
-
-app.get('/health', (req, res) => res.json({ ok: true }));
-
-// ============================================================
-// WORKER ENTRY — матчинг + нагадування + завдання + закриття
-// Викликається воркером кожну хвилину через /worker/tick
+// WORKER TICK
+// POST /worker/tick   header: x-worker-secret
 // ============================================================
 
 app.post('/worker/tick', async (req, res) => {
-    const secret = req.headers['x-worker-secret'];
-    if (secret !== process.env.WORKER_SECRET) return res.status(403).json({ error: 'Forbidden' });
+    if (req.headers['x-worker-secret'] !== process.env.WORKER_SECRET) {
+        return res.status(403).json({ error: 'Forbidden' });
+    }
 
-    const now = new Date();
-    const h = now.getHours();
-    const m = now.getMinutes();
-    const today = now.toISOString().split('T')[0];
+    // Всі часові розрахунки через Luxon — без ручного modulo
+    const { now, slotDate, remDt, slotDt, closeDt, feedDt } = getSlotTimings();
 
-    // За 15 хв: нагадування
-    if (h === SLOT_HOUR && m === SLOT_MIN - 15) {
+    // ── НАГАДУВАННЯ: за 15 хв (вікно ±2 хв) ──
+    if (inWindow(now, remDt, 2, 2)) {
         const intents = await query(
-            `SELECT ji.*, u.telegram_id FROM join_intents ji
+            `SELECT ji.user_id, u.telegram_id FROM join_intents ji
              JOIN users u ON u.id = ji.user_id
-             WHERE ji.slot_date = $1`, [today]
+             WHERE ji.slot_date = $1
+               AND ji.task_sent = FALSE
+               AND (ji.reminder_sent = FALSE OR ji.reminder_sent IS NULL)
+               AND (u.blocked = FALSE OR u.blocked IS NULL)`,
+            [slotDate]
         );
         for (const i of intents.rows) {
-            try {
-                await send(i.telegram_id,
-                    `⏰ Точка відкриється через 15 хвилин.\n\n` +
-                    `${LOCATION}.\n\n` +
-                    `Якщо поруч буде ще хтось — ви зробите завдання разом.\n` +
-                    `Якщо ні — точка працює в тихому режимі.`
-                );
-            } catch (e) { console.error('reminder error', e.message); }
+            await send(i.telegram_id,
+                `⏰ Точка відкриється через 15 хвилин.\n\n` +
+                `${LOCATION}.\n\n` +
+                `Якщо поруч буде ще хтось — ви зробите завдання разом.\n` +
+                `Якщо ні — точка працює в тихому режимі.`
+            );
+            await query(
+                `UPDATE join_intents SET reminder_sent = TRUE WHERE user_id = $1 AND slot_date = $2`,
+                [i.user_id, slotDate]
+            );
         }
     }
 
-    // О SLOT_HOUR:SLOT_MIN — видаємо завдання + матчимо
-    if (h === SLOT_HOUR && m === SLOT_MIN) {
-        const intents = await query(
-            `SELECT ji.*, u.telegram_id, u.meetings_completed
-             FROM join_intents ji
-             JOIN users u ON u.id = ji.user_id
-             WHERE ji.slot_date = $1 AND ji.task_sent = FALSE`,
-            [today]
-        );
+    // ── МАТЧИНГ + ЗАВДАННЯ: вікно [0, +5 хв] від слоту ──
+    if (inWindow(now, slotDt, 0, 5)) {
+        const client = await pool.connect();
+        try {
+            await client.query('BEGIN');
+            const intentsRes = await client.query(
+                `SELECT ji.id, ji.user_id, u.telegram_id, u.meetings_completed, u.is_helper
+                 FROM join_intents ji
+                 JOIN users u ON u.id = ji.user_id
+                 WHERE ji.slot_date = $1
+                   AND ji.task_sent = FALSE
+                   AND (u.blocked = FALSE OR u.blocked IS NULL)
+                 ORDER BY u.is_helper ASC, ji.created_at ASC
+                 FOR UPDATE OF ji SKIP LOCKED`,
+                [slotDate]
+            );
 
-        const users = intents.rows;
-        const pairs = [];
-        const solos = [];
+            const users = intentsRes.rows;
+            const pairs = [];
+            const solos = [];
+            for (let i = 0; i + 1 < users.length; i += 2) pairs.push([users[i], users[i + 1]]);
+            if (users.length % 2 !== 0) solos.push(users[users.length - 1]);
 
-        for (let i = 0; i + 1 < users.length; i += 2) {
-            pairs.push([users[i], users[i + 1]]);
-        }
-        if (users.length % 2 !== 0) solos.push(users[users.length - 1]);
-
-        // Пари
-        for (const [a, b] of pairs) {
-            const task = pickTask(Math.min(a.meetings_completed, b.meetings_completed) + 1, true);
-            for (const u of [a, b]) {
-                try {
-                    await send(u.telegram_id, `*Завдання:*\n\n${task.text}`);
-                    await query(
-                        `UPDATE join_intents SET task_sent = TRUE, task_type = $1, meeting_mode = 'together'
-                         WHERE user_id = $2 AND slot_date = $3`,
-                        [task.type, u.user_id, today]
-                    );
-                    await query(`UPDATE users SET meetings_completed = meetings_completed + 1 WHERE id = $1`, [u.user_id]);
-                } catch (e) { console.error('task pair error', e.message); }
-            }
-        }
-
-        // Сольні
-        for (const u of solos) {
-            const task = pickTask(u.meetings_completed + 1, false);
-            try {
-                await send(u.telegram_id, `*Завдання:*\n\n${task.text}`);
-                await query(
-                    `UPDATE join_intents SET task_sent = TRUE, task_type = $1, meeting_mode = 'solo'
-                     WHERE user_id = $2 AND slot_date = $3`,
-                    [task.type, u.user_id, today]
+            for (const [a, b] of pairs) {
+                const task = pickTask(Math.min(a.meetings_completed, b.meetings_completed) + 1, true);
+                a._task = task; b._task = task;
+                await client.query(
+                    `UPDATE join_intents SET task_sent=TRUE, task_type=$1, meeting_mode='together', partner_id=$2
+                     WHERE user_id=$3 AND slot_date=$4`,
+                    [task.type, b.user_id, a.user_id, slotDate]
                 );
-                await query(`UPDATE users SET meetings_completed = meetings_completed + 1 WHERE id = $1`, [u.user_id]);
-            } catch (e) { console.error('task solo error', e.message); }
+                await client.query(
+                    `UPDATE join_intents SET task_sent=TRUE, task_type=$1, meeting_mode='together', partner_id=$2
+                     WHERE user_id=$3 AND slot_date=$4`,
+                    [task.type, a.user_id, b.user_id, slotDate]
+                );
+                await client.query(
+                    `UPDATE users SET meetings_completed = meetings_completed + 1 WHERE id IN ($1, $2)`,
+                    [a.user_id, b.user_id]
+                );
+            }
+            for (const u of solos) {
+                const task = pickTask(u.meetings_completed + 1, false);
+                u._task = task;
+                await client.query(
+                    `UPDATE join_intents SET task_sent=TRUE, task_type=$1, meeting_mode='solo'
+                     WHERE user_id=$2 AND slot_date=$3`,
+                    [task.type, u.user_id, slotDate]
+                );
+                await client.query(
+                    `UPDATE users SET meetings_completed = meetings_completed + 1 WHERE id=$1`,
+                    [u.user_id]
+                );
+            }
+            await client.query('COMMIT');
+
+            for (const [a, b] of pairs) {
+                await send(a.telegram_id, `*Завдання:*\n\n${a._task.text}`);
+                await send(b.telegram_id, `*Завдання:*\n\n${b._task.text}`);
+            }
+            for (const u of solos) {
+                await send(u.telegram_id, `*Завдання:*\n\n${u._task.text}`);
+            }
+        } catch (e) {
+            await client.query('ROLLBACK');
+            console.error('Matching error:', e.message);
+        } finally {
+            client.release();
         }
 
-        // Notify-next users
         const notifyUsers = await query(
-            `SELECT telegram_id FROM users WHERE notify_next = TRUE`
+            `SELECT telegram_id FROM users WHERE notify_next=TRUE AND (blocked=FALSE OR blocked IS NULL)`
         );
+        const slotIds = await query(
+            `SELECT u.telegram_id FROM join_intents ji JOIN users u ON u.id=ji.user_id WHERE ji.slot_date=$1`,
+            [slotDate]
+        );
+        const sentIds = new Set(slotIds.rows.map(i => i.telegram_id));
         for (const u of notifyUsers.rows) {
-            if (!users.find(i => i.telegram_id === u.telegram_id)) {
-                try {
-                    await send(u.telegram_id,
-                        `🌿 Точка зараз відкрита!\n\n${slotTimeStr()}, ${LOCATION}.\n\nХочеш зайти?`,
-                        kbd([[{ text: '🌿 Хочу зайти', callback_data: 'join' }]])
-                    );
-                    await query(`UPDATE users SET notify_next = FALSE WHERE telegram_id = $1`, [u.telegram_id]);
-                } catch (e) {}
+            if (!sentIds.has(u.telegram_id)) {
+                await send(u.telegram_id,
+                    `🌿 Точка зараз відкрита!\n\n${slotTimeStr()}, ${LOCATION}.`,
+                    kbd([[{ text: '🌿 Хочу зайти', callback_data: 'join' }]])
+                );
+                await query(`UPDATE users SET notify_next=FALSE WHERE telegram_id=$1`, [u.telegram_id]);
             }
         }
     }
 
-    // +20 хв: закриття точки
-    const closeH = SLOT_HOUR + Math.floor((SLOT_MIN + 20) / 60);
-    const closeM = (SLOT_MIN + 20) % 60;
-
-    if (h === closeH && m === closeM) {
+    // ── ЗАКРИТТЯ: вікно [0, +3 хв] від closeDt ──
+    if (inWindow(now, closeDt, 0, 3)) {
         const intents = await query(
-            `SELECT ji.*, u.telegram_id FROM join_intents ji
-             JOIN users u ON u.id = ji.user_id
-             WHERE ji.slot_date = $1 AND ji.task_sent = TRUE AND ji.closed = FALSE`,
-            [today]
+            `SELECT ji.user_id, ji.meeting_mode, u.telegram_id FROM join_intents ji
+             JOIN users u ON u.id=ji.user_id
+             WHERE ji.slot_date=$1 AND ji.task_sent=TRUE AND ji.closed=FALSE
+               AND (u.blocked=FALSE OR u.blocked IS NULL)`,
+            [slotDate]
         );
         for (const i of intents.rows) {
-            try {
-                const isSolo = i.meeting_mode === 'solo';
-                let text = `Точка закривається.\n\nМожна піти. Можна сидіти ще. Немає правила.`;
-                if (isSolo) {
-                    text += `\n\nТвоє фото в архіві сам.\nНаступна людина побачить його перед тим, як зайти.`;
-                }
-                text += `\n\nЧерез 2 години надішлемо 3 коротких питання.`;
-                await send(i.telegram_id, text);
-                await query(
-                    `UPDATE join_intents SET closed = TRUE WHERE user_id = $1 AND slot_date = $2`,
-                    [i.user_id, today]
-                );
-            } catch (e) { console.error('close error', e.message); }
+            const isSolo = i.meeting_mode === 'solo';
+            let text = `Точка закривається.\n\nМожна піти. Можна сидіти ще. Немає правила.`;
+            if (isSolo) text += `\n\nТвоє фото в архіві сам.\nНаступна людина побачить його перед тим, як зайти.`;
+            text += `\n\nЧерез 2 години надішлемо 3 коротких питання.`;
+            await send(i.telegram_id, text);
+            await query(
+                `UPDATE join_intents SET closed=TRUE WHERE user_id=$1 AND slot_date=$2`,
+                [i.user_id, slotDate]
+            );
         }
     }
 
-    // +2 год 20 хв: фідбек
-    const feedH = closeH + 2;
-    const feedM = closeM;
-
-    if (h === feedH && m === feedM) {
+    // ── ФІДБЕК: вікно [0, +3 хв] від feedDt ──
+    // БАГ ВИПРАВЛЕНО: feedDt через Luxon, а не feedH % 24
+    if (inWindow(now, feedDt, 0, 3)) {
         const intents = await query(
-            `SELECT ji.*, u.telegram_id FROM join_intents ji
-             JOIN users u ON u.id = ji.user_id
-             WHERE ji.slot_date = $1 AND ji.closed = TRUE AND ji.feedback_sent = FALSE`,
-            [today]
+            `SELECT ji.user_id, u.telegram_id FROM join_intents ji
+             JOIN users u ON u.id=ji.user_id
+             WHERE ji.slot_date=$1 AND ji.closed=TRUE AND ji.feedback_sent=FALSE
+               AND (u.blocked=FALSE OR u.blocked IS NULL)`,
+            [slotDate]
         );
         for (const i of intents.rows) {
-            try {
-                await send(i.telegram_id,
-                    `Як ти себе почуваєш?`,
-                    kbd([[
-                        { text: '1', callback_data: 'mood_1' },
-                        { text: '2', callback_data: 'mood_2' },
-                        { text: '3', callback_data: 'mood_3' },
-                        { text: '4', callback_data: 'mood_4' },
-                        { text: '5', callback_data: 'mood_5' },
-                    ]])
-                );
-                await query(
-                    `UPDATE join_intents SET feedback_sent = TRUE WHERE user_id = $1 AND slot_date = $2`,
-                    [i.user_id, today]
-                );
-            } catch (e) { console.error('feedback error', e.message); }
+            await send(i.telegram_id, `Як ти себе почуваєш?`, kbd([[
+                { text: '1', callback_data: 'mood_1' },
+                { text: '2', callback_data: 'mood_2' },
+                { text: '3', callback_data: 'mood_3' },
+                { text: '4', callback_data: 'mood_4' },
+                { text: '5', callback_data: 'mood_5' },
+            ]]));
+            await query(
+                `UPDATE join_intents SET feedback_sent=TRUE WHERE user_id=$1 AND slot_date=$2`,
+                [i.user_id, slotDate]
+            );
         }
 
-        // Асиметричний фідбек партнерів
-        const paired = await query(
+        const pairsToNotify = await query(
             `SELECT ji1.user_id as uid1, u1.telegram_id as tg1,
                     ji2.user_id as uid2, u2.telegram_id as tg2
              FROM join_intents ji1
-             JOIN join_intents ji2 ON ji2.slot_date = ji1.slot_date
-               AND ji2.partner_id = ji1.user_id
-             JOIN users u1 ON u1.id = ji1.user_id
-             JOIN users u2 ON u2.id = ji2.user_id
-             WHERE ji1.slot_date = $1
-               AND ji1.meeting_mode = 'together'
-               AND (ji1.feedback_return = TRUE OR ji2.feedback_return = TRUE)
-               AND ji1.partner_notified = FALSE`,
-            [today]
+             JOIN join_intents ji2 ON ji2.user_id=ji1.partner_id AND ji2.slot_date=ji1.slot_date
+             JOIN users u1 ON u1.id=ji1.user_id
+             JOIN users u2 ON u2.id=ji2.user_id
+             WHERE ji1.slot_date=$1
+               AND ji1.meeting_mode='together'
+               AND ji1.partner_id IS NOT NULL
+               AND (ji1.feedback_return=TRUE OR ji2.feedback_return=TRUE)
+               AND ji1.partner_notified=FALSE
+               AND (u1.blocked=FALSE OR u1.blocked IS NULL)`,
+            [slotDate]
         );
-
-        for (const pair of paired.rows) {
+        for (const pair of pairsToNotify.rows) {
             const msg =
                 `Хтось із вас хоче ще.\n\n` +
                 `Якщо обидва натиснете "Разом" — наступна точка разом.\n` +
@@ -700,20 +661,23 @@ app.post('/worker/tick', async (req, res) => {
                 { text: 'Разом', callback_data: 'partner_together' },
                 { text: 'Новий', callback_data: 'partner_new' },
             ]]);
-            try {
-                await send(pair.tg1, msg, pKbd);
-                await send(pair.tg2, msg, pKbd);
-                await query(
-                    `UPDATE join_intents SET partner_notified = TRUE
-                     WHERE user_id IN ($1, $2) AND slot_date = $3`,
-                    [pair.uid1, pair.uid2, today]
-                );
-            } catch (e) {}
+            await send(pair.tg1, msg, pKbd);
+            await send(pair.tg2, msg, pKbd);
+            await query(
+                `UPDATE join_intents SET partner_notified=TRUE WHERE user_id IN ($1,$2) AND slot_date=$3`,
+                [pair.uid1, pair.uid2, slotDate]
+            );
         }
     }
 
-    res.json({ ok: true });
+    res.json({ ok: true, ts: now.toISO() });
 });
+
+// ============================================================
+// HEALTH
+// ============================================================
+
+app.get('/health', (req, res) => res.json({ ok: true, version: '1.9' }));
 
 // ============================================================
 // START
@@ -721,6 +685,6 @@ app.post('/worker/tick', async (req, res) => {
 
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, async () => {
-    console.log(`Doto API running on port ${PORT}`);
+    console.log(`Doto API v1.9 running on port ${PORT}`);
     await setWebhook();
 });
