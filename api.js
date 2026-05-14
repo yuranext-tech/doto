@@ -1,7 +1,6 @@
 // ============================================================
 // DOTO — API + BOT (Express.js, webhook mode)
-// v1.9 — виправлено: slotDateForHour логіка, feedH % 24,
-//         polling вимкнено (більше немає дублювання апдейтів)
+// v1.10 — тексти оновлено, luxon, polling:false, slotDateForHour виправлено
 // ============================================================
 
 const express = require('express');
@@ -34,10 +33,13 @@ const SLOT_HOUR = parseInt(process.env.SLOT_HOUR || '18');
 const SLOT_MIN  = parseInt(process.env.SLOT_MIN  || '30');
 const CITY_TZ   = process.env.CITY_TZ || 'Europe/Kyiv';
 
-// БАГ ВИПРАВЛЕНО: { polling: false } замість { webHook: false }
-// webHook: false запускав polling (постійний GET до Telegram API)
-// одночасно з нашим Express webhook — дублювання апдейтів.
-// Правильно: polling: false = тільки webhook через Express.
+const LOCATION_CONTEXT = [
+    'Сьогодні біля фонтану тихо.',
+    'Після дощу там особливо дивно.',
+    'Сьогодні точка під деревами.',
+    'Вітер змінив напрямок. Це помітно.',
+];
+
 const bot = new TelegramBot(TOKEN, { polling: false });
 
 async function setWebhook() {
@@ -79,40 +81,26 @@ function slotTimeStr() {
     return `${String(SLOT_HOUR).padStart(2,'0')}:${String(SLOT_MIN).padStart(2,'0')}`;
 }
 
-// БАГ ВИПРАВЛЕНО: попередня логіка з diff > 6 давала фантомні дати
-// якщо поточний час менший за час слоту (слот "ще попереду" сьогодні,
-// але насправді він вже вчора).
-// Правильна логіка: якщо зараз ДО часу слоту — слот ще не настав сьогодні,
-// тобто активний слот — вчорашній.
 function slotDateForHour(slotH) {
     const now = kyivNow();
     const todaySlotDt = now.set({ hour: slotH, minute: SLOT_MIN, second: 0, millisecond: 0 });
     if (now < todaySlotDt) {
-        // Зараз раніше ніж час слоту — поточний активний слот вчора
         return now.minus({ days: 1 }).toISODate();
     }
     return now.toISODate();
 }
 
-// Обчислює DateTime закриття і фідбеку через Luxon — без ручного modulo
-// БАГ ВИПРАВЛЕНО: feedH % 24 змішував години і хвилини,
-// через що фідбек о 00:xx не приходив
 function getSlotTimings() {
     const now = kyivNow();
     const slotDate = slotDateForHour(SLOT_HOUR);
-
-    // Будуємо DateTime слоту на правильній даті
     const slotDt = DateTime.fromISO(slotDate, { zone: CITY_TZ })
         .set({ hour: SLOT_HOUR, minute: SLOT_MIN, second: 0 });
-
-    const closeDt  = slotDt.plus({ minutes: 20 });
-    const feedDt   = closeDt.plus({ hours: 2 });
-    const remDt    = slotDt.minus({ minutes: 15 });
-
+    const closeDt = slotDt.plus({ minutes: 20 });
+    const feedDt  = closeDt.plus({ hours: 2 });
+    const remDt   = slotDt.minus({ minutes: 15 });
     return { now, slotDate, slotDt, closeDt, feedDt, remDt };
 }
 
-// Перевіряє чи поточний час в вікні [target - before, target + after] хвилин
 function inWindow(now, targetDt, beforeMin, afterMin) {
     const diffMin = now.diff(targetDt, 'minutes').minutes;
     return diffMin >= -beforeMin && diffMin <= afterMin;
@@ -224,6 +212,7 @@ bot.onText(/\/start/, async (msg) => {
     const chatId     = msg.chat.id;
     const telegramId = String(msg.from.id);
     const username   = msg.from.username || msg.from.first_name || '';
+    const locCtx     = LOCATION_CONTEXT[Math.floor(Math.random() * LOCATION_CONTEXT.length)];
 
     await query(
         `INSERT INTO users (id, telegram_id, username)
@@ -238,12 +227,15 @@ bot.onText(/\/start/, async (msg) => {
         `Ось як це виглядає:\n` +
         `🐸 «Знайди жабку, яка дивиться як твій колишній о 3 ночі»\n` +
         `🌳 «Знайди дерево, яке ходить до психолога»\n\n` +
-        `Приходиш — отримуєш завдання — робиш.\n` +
+        `Приходиш.\n` +
+        `Отримуєш дивне маленьке завдання.\n` +
+        `Робиш його.\n` +
         `Поруч може бути хтось. А може — ні.\n\n` +
-        `Найближча точка: сьогодні ${slotTimeStr()}, ${LOCATION}.`,
+        `Найближча точка: сьогодні ${slotTimeStr()}, ${LOCATION}.\n\n` +
+        `${locCtx}`,
         kbd([[
-            { text: '🌿 Хочу зайти', callback_data: 'join' },
-            { text: '📷 Архів точки', callback_data: 'archive' },
+            { text: '🌿 Хочу зайти',  callback_data: 'join' },
+            { text: '📷 Сліди точки', callback_data: 'archive' },
         ]])
     );
 });
@@ -283,32 +275,27 @@ bot.on('callback_query', async (q) => {
             `Нагадаємо за 15 хвилин до точки.\n\n` +
             `Якщо передумаєш — просто не приходь. Без штрафів.\n\n` +
             `Нічого не треба брати. Тільки телефон.\n` +
-            `І трохи настрою дивитися на світ дивно.`,
-            kbd([[{ text: 'Ок', callback_data: 'ok_joined' }]])
+            `І трохи настрою дивитися на світ дивно.\n\n` +
+            `До ${slotTimeStr()} ✦`
         );
-        return;
-    }
-
-    if (data === 'ok_joined') {
-        await send(chatId, `До ${slotTimeStr()} ✦`);
         return;
     }
 
     if (data === 'archive') {
         const { together, solo, counts } = await getArchiveSummary();
-        let text = `*Архів точки*\n\n`;
+        let text = `*Сліди точки*\n\n`;
         if ((counts.together || 0) > 0) {
-            text += `*Архів разом* — ${counts.together} фото:\n`;
+            text += `*Разом* — ${counts.together} фото:\n`;
             together.forEach(a => { text += `📷 ${a.caption || '…'}\n`; });
         } else {
-            text += `*Архів разом* — поки порожній\n`;
+            text += `*Разом* — поки тихо\n`;
         }
         text += `\n`;
         if ((counts.solo || 0) > 0) {
-            text += `*Архів сам* — ${counts.solo} фото:\n`;
+            text += `*Сам* — ${counts.solo} фото:\n`;
             solo.forEach(a => { text += `🌿 ${a.caption || '…'}\n`; });
         } else {
-            text += `*Архів сам* — поки порожній\n`;
+            text += `*Сам* — поки тихо\n`;
         }
         text += `\nНаступна точка: сьогодні ${slotTimeStr()}`;
         await send(chatId, text, kbd([[
@@ -416,8 +403,6 @@ bot.on('photo', async (msg) => {
 
     const intent = await getIntent(user.id, slotDate);
     if (!intent) return;
-
-    // Приймаємо тільки перше фото — ігноруємо повторні
     if (intent.photo_received) return;
 
     const photo = msg.photo[msg.photo.length - 1];
@@ -474,7 +459,6 @@ app.post('/worker/tick', async (req, res) => {
         return res.status(403).json({ error: 'Forbidden' });
     }
 
-    // Всі часові розрахунки через Luxon — без ручного modulo
     const { now, slotDate, remDt, slotDt, closeDt, feedDt } = getSlotTimings();
 
     // ── НАГАДУВАННЯ: за 15 хв (вікно ±2 хв) ──
@@ -490,10 +474,7 @@ app.post('/worker/tick', async (req, res) => {
         );
         for (const i of intents.rows) {
             await send(i.telegram_id,
-                `⏰ Точка відкриється через 15 хвилин.\n\n` +
-                `${LOCATION}.\n\n` +
-                `Якщо поруч буде ще хтось — ви зробите завдання разом.\n` +
-                `Якщо ні — точка працює в тихому режимі.`
+                `⏰ Ще 15 хвилин.\n\n${LOCATION}.\n\nНе поспішай.`
             );
             await query(
                 `UPDATE join_intents SET reminder_sent = TRUE WHERE user_id = $1 AND slot_date = $2`,
@@ -559,11 +540,11 @@ app.post('/worker/tick', async (req, res) => {
             await client.query('COMMIT');
 
             for (const [a, b] of pairs) {
-                await send(a.telegram_id, `*Завдання:*\n\n${a._task.text}`);
-                await send(b.telegram_id, `*Завдання:*\n\n${b._task.text}`);
+                await send(a.telegram_id, `Точка відкрита.\n\n${a._task.text}\n\nМожна мовчати.`);
+                await send(b.telegram_id, `Точка відкрита.\n\n${b._task.text}\n\nМожна мовчати.`);
             }
             for (const u of solos) {
-                await send(u.telegram_id, `*Завдання:*\n\n${u._task.text}`);
+                await send(u.telegram_id, `Точка відкрита.\n\n${u._task.text}\n\nНе треба швидко.`);
             }
         } catch (e) {
             await client.query('ROLLBACK');
@@ -602,7 +583,7 @@ app.post('/worker/tick', async (req, res) => {
         );
         for (const i of intents.rows) {
             const isSolo = i.meeting_mode === 'solo';
-            let text = `Точка закривається.\n\nМожна піти. Можна сидіти ще. Немає правила.`;
+            let text = `Точка закривається.\n\nМожна піти. Можна сидіти ще.\n\nНемає правила.`;
             if (isSolo) text += `\n\nТвоє фото в архіві сам.\nНаступна людина побачить його перед тим, як зайти.`;
             text += `\n\nЧерез 2 години надішлемо 3 коротких питання.`;
             await send(i.telegram_id, text);
@@ -614,7 +595,6 @@ app.post('/worker/tick', async (req, res) => {
     }
 
     // ── ФІДБЕК: вікно [0, +3 хв] від feedDt ──
-    // БАГ ВИПРАВЛЕНО: feedDt через Luxon, а не feedH % 24
     if (inWindow(now, feedDt, 0, 3)) {
         const intents = await query(
             `SELECT ji.user_id, u.telegram_id FROM join_intents ji
@@ -624,7 +604,7 @@ app.post('/worker/tick', async (req, res) => {
             [slotDate]
         );
         for (const i of intents.rows) {
-            await send(i.telegram_id, `Як ти себе почуваєш?`, kbd([[
+            await send(i.telegram_id, `Пройшло вже дві години.\n\nЯк ти себе почуваєш?`, kbd([[
                 { text: '1', callback_data: 'mood_1' },
                 { text: '2', callback_data: 'mood_2' },
                 { text: '3', callback_data: 'mood_3' },
@@ -677,7 +657,7 @@ app.post('/worker/tick', async (req, res) => {
 // HEALTH
 // ============================================================
 
-app.get('/health', (req, res) => res.json({ ok: true, version: '1.9' }));
+app.get('/health', (req, res) => res.json({ ok: true, version: '1.10' }));
 
 // ============================================================
 // START
@@ -685,6 +665,6 @@ app.get('/health', (req, res) => res.json({ ok: true, version: '1.9' }));
 
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, async () => {
-    console.log(`Doto API v1.9 running on port ${PORT}`);
+    console.log(`Doto API v1.10 running on port ${PORT}`);
     await setWebhook();
 });
