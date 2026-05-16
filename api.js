@@ -90,6 +90,18 @@ function slotDateForHour(slotH) {
     return now.toISODate();
 }
 
+// Дата наступного слоту — якщо зараз до слоту, то сьогодні; якщо після — завтра
+// БАГ ВИПРАВЛЕНО: localToday() о 1:40 повертає сьогодні, але слот буде завтра
+function nextSlotDate() {
+    const now = kyivNow();
+    const todaySlot = now.set({ hour: SLOT_HOUR, minute: SLOT_MIN, second: 0, millisecond: 0 });
+    if (now > todaySlot) {
+        // Слот вже минув сьогодні — наступний завтра
+        return now.plus({ days: 1 }).toISODate();
+    }
+    return now.toISODate();
+}
+
 function getSlotTimings() {
     const now = kyivNow();
     const slotDate = slotDateForHour(SLOT_HOUR);
@@ -142,7 +154,7 @@ async function getIntent(userId, slotDate) {
 // Щоб додати нову задачу: редагуй tasks.js, не api.js
 // ============================================================
 
-const { pickTask } = require('./tasks');
+const { pickTask, pickAfterglowTogether, pickAfterglowSolo } = require('./tasks');
 
 // ============================================================
 // ARCHIVE HELPERS
@@ -233,7 +245,7 @@ bot.on('callback_query', async (q) => {
             `INSERT INTO join_intents (id, user_id, slot_date)
              VALUES ($1, $2, $3)
              ON CONFLICT (user_id, slot_date) DO NOTHING`,
-            [uuidv4(), user.id, localToday()]
+            [uuidv4(), user.id, nextSlotDate()]
         );
         await send(chatId,
             `Готово.\n\n` +
@@ -472,30 +484,29 @@ app.post('/worker/tick', async (req, res) => {
             if (users.length % 2 !== 0) solos.push(users[users.length - 1]);
 
             for (const [a, b] of pairs) {
-                const task = pickTask(Math.min(a.meetings_completed, b.meetings_completed) + 1, true);
+                const task = pickTask(Math.min(a.meetings_completed, b.meetings_completed) + 1, true, slotDate);
                 a._task = task; b._task = task;
-                await client.query(
-                    `UPDATE join_intents SET task_sent=TRUE, task_type=$1, meeting_mode='together', partner_id=$2
-                     WHERE user_id=$3 AND slot_date=$4`,
-                    [task.type, b.user_id, a.user_id, slotDate]
-                );
-                await client.query(
-                    `UPDATE join_intents SET task_sent=TRUE, task_type=$1, meeting_mode='together', partner_id=$2
-                     WHERE user_id=$3 AND slot_date=$4`,
-                    [task.type, a.user_id, b.user_id, slotDate]
-                );
+                for (const [u, partner] of [[a, b], [b, a]]) {
+                    await client.query(
+                        `UPDATE join_intents SET task_sent=TRUE, task_type=$1, meeting_mode='together', partner_id=$2,
+                         act1_text=$3, act2_text=$4, act3_text=$5
+                         WHERE user_id=$6 AND slot_date=$7`,
+                        [task.type, partner.user_id, task.act1||null, task.text, task.act3||null, u.user_id, slotDate]
+                    );
+                }
                 await client.query(
                     `UPDATE users SET meetings_completed = meetings_completed + 1 WHERE id IN ($1, $2)`,
                     [a.user_id, b.user_id]
                 );
             }
             for (const u of solos) {
-                const task = pickTask(u.meetings_completed + 1, false);
+                const task = pickTask(u.meetings_completed + 1, false, slotDate);
                 u._task = task;
                 await client.query(
-                    `UPDATE join_intents SET task_sent=TRUE, task_type=$1, meeting_mode='solo'
-                     WHERE user_id=$2 AND slot_date=$3`,
-                    [task.type, u.user_id, slotDate]
+                    `UPDATE join_intents SET task_sent=TRUE, task_type=$1, meeting_mode='solo',
+                     act1_text=NULL, act2_text=$2, act3_text=NULL
+                     WHERE user_id=$3 AND slot_date=$4`,
+                    [task.type, task.text, u.user_id, slotDate]
                 );
                 await client.query(
                     `UPDATE users SET meetings_completed = meetings_completed + 1 WHERE id=$1`,
@@ -504,13 +515,16 @@ app.post('/worker/tick', async (req, res) => {
             }
             await client.query('COMMIT');
 
+            // АКТ 1 — одразу: синхронізація (максимальне напруження)
             for (const [a, b] of pairs) {
-                await send(a.telegram_id, `Точка відкрита.\n\n${a._task.text}\n\nМожна мовчати.`);
-                await send(b.telegram_id, `Точка відкрита.\n\n${b._task.text}\n\nМожна мовчати.`);
+                await send(a.telegram_id, `Точка відкрита.\n\n${a._task.act1||a._task.text}`);
+                await send(b.telegram_id, `Точка відкрита.\n\n${b._task.act1||b._task.text}`);
             }
+            // Соло — одразу своє завдання
             for (const u of solos) {
                 await send(u.telegram_id, `Точка відкрита.\n\n${u._task.text}\n\nНе треба швидко.`);
             }
+            // АКТ 2 і АКТ 3 — воркер надішле через окремі тіки (+3 хв і +10 хв)
         } catch (e) {
             await client.query('ROLLBACK');
             console.error('Matching error:', e.message);
@@ -537,6 +551,46 @@ app.post('/worker/tick', async (req, res) => {
         }
     }
 
+    // ── АКТ 2: через 3 хв після слоту ──
+    if (inWindow(now, slotDt.plus({ minutes: 3 }), 0, 2)) {
+        const intents = await query(
+            `SELECT ji.user_id, ji.act2_text, u.telegram_id FROM join_intents ji
+             JOIN users u ON u.id=ji.user_id
+             WHERE ji.slot_date=$1 AND ji.meeting_mode='together'
+               AND ji.task_sent=TRUE AND ji.act2_sent=FALSE
+               AND ji.act2_text IS NOT NULL
+               AND (u.blocked=FALSE OR u.blocked IS NULL)`,
+            [slotDate]
+        );
+        for (const i of intents.rows) {
+            await send(i.telegram_id, i.act2_text);
+            await query(
+                `UPDATE join_intents SET act2_sent=TRUE WHERE user_id=$1 AND slot_date=$2`,
+                [i.user_id, slotDate]
+            );
+        }
+    }
+
+    // ── АКТ 3: через 10 хв після слоту ──
+    if (inWindow(now, slotDt.plus({ minutes: 10 }), 0, 2)) {
+        const intents = await query(
+            `SELECT ji.user_id, ji.act3_text, u.telegram_id FROM join_intents ji
+             JOIN users u ON u.id=ji.user_id
+             WHERE ji.slot_date=$1 AND ji.meeting_mode='together'
+               AND ji.task_sent=TRUE AND ji.act3_sent=FALSE
+               AND ji.act3_text IS NOT NULL
+               AND (u.blocked=FALSE OR u.blocked IS NULL)`,
+            [slotDate]
+        );
+        for (const i of intents.rows) {
+            await send(i.telegram_id, i.act3_text);
+            await query(
+                `UPDATE join_intents SET act3_sent=TRUE WHERE user_id=$1 AND slot_date=$2`,
+                [i.user_id, slotDate]
+            );
+        }
+    }
+
     // ── ЗАКРИТТЯ: вікно [0, +3 хв] від closeDt ──
     if (inWindow(now, closeDt, 0, 3)) {
         const intents = await query(
@@ -548,9 +602,7 @@ app.post('/worker/tick', async (req, res) => {
         );
         for (const i of intents.rows) {
             const isSolo = i.meeting_mode === 'solo';
-            let text = `Точка закривається.\n\nМожна піти. Можна сидіти ще.\n\nНемає правила.`;
-            if (isSolo) text += `\n\nТвоє фото в архіві сам.\nНаступна людина побачить його перед тим, як зайти.`;
-            text += `\n\nЧерез 2 години надішлемо 3 коротких питання.`;
+            const text = isSolo ? pickAfterglowSolo() : pickAfterglowTogether();
             await send(i.telegram_id, text);
             await query(
                 `UPDATE join_intents SET closed=TRUE WHERE user_id=$1 AND slot_date=$2`,
